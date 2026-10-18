@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeepRead · 长文精读</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --card:#1c2129; --border:#2d333b;
+    --ink:#e6edf3; --muted:#8b949e; --accent:#4a9eff; --ok:#3fb950;
+    --warn:#d29922; --bad:#f85149;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--bg);color:var(--ink);font-family:"Segoe UI","Microsoft YaHei",sans-serif;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+  header{display:flex;align-items:center;gap:14px;padding:12px 20px;border-bottom:1px solid var(--border);background:var(--panel)}
+  header h1{font-size:17px} header h1 b{color:var(--accent)}
+  .pill{font-size:11px;padding:2px 10px;border-radius:99px;border:1px solid var(--border);color:var(--muted)}
+  .pill.ok{color:var(--ok);border-color:var(--ok)}
+  main{flex:1;display:grid;grid-template-columns:380px 1fr;overflow:hidden}
+  /* ---------- 左栏：输入 ---------- */
+  #left{border-right:1px solid var(--border);padding:16px;overflow-y:auto;display:flex;flex-direction:column;gap:14px}
+  .modes{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .mode{border:1px solid var(--border);border-radius:10px;padding:10px 12px;cursor:pointer;background:var(--card);transition:.15s}
+  .mode:hover{border-color:var(--accent)}
+  .mode.sel{border-color:var(--accent);background:#16222f;box-shadow:0 0 0 1px var(--accent)}
+  .mode .t{font-weight:700;font-size:13.5px}
+  .mode .d{font-size:11px;color:var(--muted);margin-top:3px;line-height:1.45}
+  label{font-size:12px;color:var(--muted);display:block;margin-bottom:6px}
+  input[type=text]{width:100%;background:var(--card);border:1px solid var(--border);border-radius:8px;color:var(--ink);padding:8px 10px;font-size:13px}
+  textarea{width:100%;height:170px;background:var(--card);border:1px solid var(--border);border-radius:8px;color:var(--ink);padding:10px;font-size:13px;resize:vertical;font-family:inherit}
+  .drop{border:1.5px dashed var(--border);border-radius:10px;padding:16px;text-align:center;color:var(--muted);font-size:12.5px;cursor:pointer;transition:.15s}
+  .drop:hover,.drop.over{border-color:var(--accent);color:var(--accent);background:#16222f}
+  .drop b{color:var(--accent)}
+  .btn{width:100%;padding:11px;border:none;border-radius:10px;background:var(--accent);color:#fff;font-size:14px;font-weight:700;cursor:pointer}
+  .btn:hover{filter:brightness(1.12)} .btn:disabled{opacity:.45;cursor:not-allowed}
+  .hint{font-size:11px;color:var(--muted);line-height:1.6}
+  .rec{font-size:10.5px;color:var(--ok);margin-top:4px;line-height:1.5}
+  .storybox{border:1px solid var(--border);border-radius:10px;padding:16px 20px;background:var(--panel);margin-bottom:16px;max-height:46vh;overflow-y:auto}
+  .storybox .sb-h{font-size:13px;color:var(--ok);font-weight:700;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--panel)}
+  .storybox h2{font-size:13.5px!important;margin:14px 0 6px!important}
+  .storybox p,.storybox li{font-size:13.5px;line-height:1.9}
+  .cmp{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .cmp>div{border:1px solid var(--border);border-radius:10px;padding:14px 16px;background:var(--panel);overflow-y:auto;max-height:calc(100vh - 220px)}
+  .cmp h2{margin-top:0!important;border-left-color:var(--ok)!important}
+  @media(max-width:1100px){.cmp{grid-template-columns:1fr}}
+  /* ---------- 右栏：报告 ---------- */
+  #right{display:flex;flex-direction:column;overflow:hidden}
+  #progress{padding:10px 20px;border-bottom:1px solid var(--border);font-size:12.5px;color:var(--muted);display:none;align-items:center;gap:10px}
+  .bar{flex:1;height:5px;background:var(--card);border-radius:99px;overflow:hidden}
+  .bar i{display:block;height:100%;background:var(--accent);width:0%;transition:.4s}
+  #report{flex:1;overflow-y:auto;padding:26px 34px}
+  #report .empty{color:var(--muted);text-align:center;margin-top:18vh;font-size:13.5px;line-height:2}
+  #report h1{font-size:20px;margin-bottom:6px}
+  #report h2{font-size:15px;margin:20px 0 8px;padding-left:9px;border-left:3px solid var(--accent);color:#c9d8ea}
+  #report p,#report li{font-size:13.8px;line-height:1.85;color:#d5dde5}
+  #report ul,#report ol{padding-left:22px;margin:8px 0}
+  #report blockquote{border-left:3px solid var(--warn);background:#1f1c14;padding:8px 14px;margin:10px 0;color:#e3d9b8;font-size:13px;border-radius:0 8px 8px 0}
+  #report code{background:#22272e;padding:1px 6px;border-radius:5px;font-size:12px;color:#79c0ff}
+  #report pre{background:#0a0d12;border:1px solid var(--border);border-radius:10px;padding:14px;overflow-x:auto;margin:10px 0}
+  #report pre code{background:none}
+  #report table{border-collapse:collapse;margin:10px 0;width:100%;font-size:12.8px}
+  #report th{background:#22272e;padding:7px 10px;text-align:left;border:1px solid var(--border)}
+  #report td{padding:7px 10px;border:1px solid var(--border);color:#d5dde5;line-height:1.6}
+  #report hr{border:none;border-top:1px solid var(--border);margin:16px 0}
+  #report .err{color:var(--bad);background:#2d1517;padding:14px;border-radius:10px;font-size:13px}
+  #report .meta{color:var(--muted);font-size:12px;margin-bottom:14px}
+  #actions{padding:10px 20px;border-top:1px solid var(--border);display:flex;gap:10px}
+  #actions button{background:var(--card);border:1px solid var(--border);color:var(--ink);border-radius:8px;padding:7px 16px;font-size:12.5px;cursor:pointer}
+  #actions button:hover{border-color:var(--accent);color:var(--accent)}
+  /* ---------- 批量队列 ---------- */
+  #queue{border-top:1px solid var(--border);padding:12px 16px;display:none}
+  #queue h3{font-size:12px;color:var(--muted);margin-bottom:8px;display:flex;justify-content:space-between}
+  #q-list .qi{display:flex;align-items:center;gap:7px;font-size:11.5px;padding:5px 7px;border-radius:6px;color:var(--muted)}
+  #q-list .qi .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #q-list .qi.running{color:var(--accent);background:#16222f}
+  #q-list .qi.done{color:var(--ok);cursor:pointer}
+  #q-list .qi.done:hover{background:var(--card)}
+  #q-list .qi.error{color:var(--bad)}
+  #q-list .qi .st{font-size:10.5px;opacity:.85;flex-shrink:0}
+  .opt{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--muted);cursor:pointer;user-select:none}
+  .opt input{accent-color:var(--accent);cursor:pointer}
+  /* ---------- 历史 ---------- */
+  #hist{border-top:1px solid var(--border);padding:12px 16px}
+  #hist h3{font-size:12px;color:var(--muted);margin-bottom:8px}
+  #hist .it{font-size:11.5px;color:var(--muted);padding:4px 6px;border-radius:6px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #hist .it:hover{background:var(--card);color:var(--ink)}
+  /* ---------- 历史报告管理弹层 ---------- */
+  .modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:50}
+  .modal-mask.show{display:flex}
+  .modal{width:min(760px,94vw);max-height:82vh;background:var(--panel);border:1px solid var(--border);border-radius:14px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 12px 48px rgba(0,0,0,.4)}
+  .modal .mhead{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--border)}
+  .modal .mhead h3{margin:0;font-size:15px;flex:1}
+  .modal .mtool{display:flex;align-items:center;gap:10px;padding:10px 18px;border-bottom:1px solid var(--border);font-size:12px;color:var(--muted)}
+  .modal .mtool button{padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--ink);font-size:12px;cursor:pointer}
+  .modal .mtool button:hover{border-color:var(--accent)}
+  .modal .mtool button:disabled{opacity:.4;cursor:not-allowed}
+  .modal .mtool button.danger:hover{border-color:#e5534b;color:#e5534b}
+  .modal .mlist{overflow-y:auto;flex:1}
+  .mrow{display:flex;align-items:center;gap:10px;padding:9px 18px;border-bottom:1px solid var(--border);font-size:12.5px}
+  .mrow:hover{background:var(--card)}
+  .mrow .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;color:var(--ink)}
+  .mrow .nm:hover{color:var(--accent)}
+  .mrow .meta{font-size:11px;color:var(--muted);opacity:.8;flex:0 0 auto}
+  .mrow .act{cursor:pointer;opacity:.65;flex:0 0 auto}
+  .mrow .act:hover{opacity:1}
+  @media(max-width:900px){main{grid-template-columns:1fr}#left{display:none}}
+</style>
+</head>
+<body>
+<header>
+  <h1>📖 Deep<b>Read</b> 长文精读</h1>
+  <span class="pill" id="model-pill">连接中…</span>
+  <span class="pill">本地 Ollama · 零外部 API</span>
+</header>
+<main>
+  <div id="left">
+    <div>
+      <label>精读模式</label>
+      <div class="modes" id="modes">
+        <div class="mode sel" data-m="deep"><div class="t">🔍 深度精读</div><div class="d">核心论点+论证结构+原文金句+置信度标注</div></div>
+        <div class="mode" data-m="quick"><div class="t">⚡ 快速要点</div><div class="d">一句话总结+要点列表，最快</div></div>
+        <div class="mode" data-m="map"><div class="t">🗺️ 知识地图</div><div class="d">观点-证据-数据-关系+Mermaid 导图</div></div>
+        <div class="mode" data-m="feynman"><div class="t">🎓 大白话讲解</div><div class="d">费曼式：术语翻译+类比+追问问题</div></div>
+        <div class="mode" data-m="distill"><div class="t">🧪 萃猫蒸馏</div><div class="d">全书骨架 → 场景聚类 → 产出 N 个可导入的 SKILL.md 技能包（对标《城市生存自救指南》蒸馏成果），适合方法/经验类书籍</div></div>
+        <div class="mode" data-m="book"><div class="t">📚 整书精读</div><div class="d">按章节分部深读 → 总编汇总（全书梗概+章节脉络+主题），适合 4 万字以上长书，耗时较长</div></div>
+      </div>
+    </div>
+    <div>
+      <label>标题（可选，默认取文件名）</label>
+      <input type="text" id="title" placeholder="例：某行业白皮书 / 金锁记">
+    </div>
+    <div>
+      <label>粘贴文本</label>
+      <textarea id="text" placeholder="把长文粘贴到这里（≥50字）…&#10;或直接拖文件到下方虚线框（可多选，多文件走批量队列）"></textarea>
+    </div>
+    <div class="drop" id="drop">
+      拖入文件，或 <b>点击选择</b><br>支持 TXT / Markdown / PDF / Word(.docx) / 图片（扫描件走 OCR）<br>
+      <span style="font-size:11px">多选文件 → 自动进入批量队列串行处理</span>
+      <input type="file" id="file" accept=".txt,.md,.markdown,.pdf,.docx,.png,.jpg,.jpeg,.webp,.bmp" multiple hidden>
+    </div>
+    <label class="opt"><input type="checkbox" id="critique"> 对抗式复核（四视角评审挑刺 + 主编回应，约 +5 次模型调用；长文本默认开启）</label>
+    <label class="opt"><input type="checkbox" id="nostory"> 关闭故事梗概（叙事文本默认自动生成）</label>
+    <div style="display:flex;gap:8px">
+      <button class="btn" id="go" style="flex:1.2">开始精读</button>
+      <button class="btn" id="cmp" style="flex:1;background:#21262d;border:1px solid var(--border);color:var(--accent)">⚖️ 模式对比</button>
+      <button class="btn" id="reset" title="清空输入、进度与报告，开始下一个任务"
+        style="flex:0 0 auto;width:auto;padding:11px 18px;font-size:13px;font-weight:600;background:transparent;border:1px solid var(--border);color:var(--muted)">🗑 重置</button>
+    </div>
+    <div id="cmp-panel" style="display:none;border:1px solid var(--border);border-radius:8px;padding:10px 12px">
+      <label style="font-size:11.5px;color:var(--muted)">选择要对比的模式（至少 2 个）</label>
+      <div id="cmp-modes" style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0">
+        <label class="opt"><input type="checkbox" value="quick" checked> ⚡ 快速要点</label>
+        <label class="opt"><input type="checkbox" value="deep" checked> 🔍 深度精读</label>
+        <label class="opt"><input type="checkbox" value="map" checked> 🗺️ 知识地图</label>
+        <label class="opt"><input type="checkbox" value="feynman" checked> 🎓 大白话讲解</label>
+        <label class="opt"><input type="checkbox" value="distill"> 🧪 萃猫蒸馏</label>
+        <label class="opt"><input type="checkbox" value="book"> 📚 整书精读（慢）</label>
+      </div>
+      <button class="btn" id="cmp-go" style="width:100%">开始对比</button>
+    </div>
+    <div class="hint" id="rec-hint">管线：切段 → 逐块提取 → 分层汇总 → 按模式成稿。叙事文本（小说/故事）自动前置 ≥1500 字故事梗概。31k 字 deep 约 8-13 分钟；book 整书模式按部数成倍增加。</div>
+    <div id="queue">
+      <h3>批量队列 <span id="q-sum"></span></h3>
+      <div id="q-list" class="hint">多选文件后自动排队，单 worker 串行处理</div>
+    </div>
+    <div id="hist">
+      <h3 style="display:flex;align-items:center;justify-content:space-between">
+        <span>历史报告（reports/）</span>
+        <span style="display:flex;gap:6px">
+          <span id="hist-manage" title="打开历史报告管理" style="cursor:pointer">🗂</span>
+          <span id="hist-refresh" title="刷新列表" style="cursor:pointer">🔄</span>
+          <span id="hist-open" title="打开 reports 文件夹" style="cursor:pointer">📂</span>
+        </span>
+      </h3>
+      <div id="hist-list" class="hint">加载中…</div>
+    </div>
+  </div>
+  <div id="right">
+    <div id="progress"><span id="stage">准备中</span><div class="bar"><i id="barfill"></i></div><span id="pct"></span></div>
+    <div id="report"><div class="empty">左侧粘贴文本或拖入文件 → 选模式 → 开始精读<br>报告将在这里渲染</div></div>
+    <div id="actions" style="display:none">
+      <button onclick="downloadMd()">下载 Markdown</button>
+      <button onclick="copyMd()">复制全文</button>
+    </div>
+  </div>
+</main>
+
+<!-- 历史报告管理弹层 -->
+<div class="modal-mask" id="hist-mask">
+  <div class="modal">
+    <div class="mhead">
+      <h3>🗂 历史报告管理</h3>
+      <span class="hint" id="hm-count"></span>
+      <span class="act" title="关闭" style="cursor:pointer;font-size:16px" onclick="closeHistModal()">✕</span>
+    </div>
+    <div class="mtool">
+      <label style="display:flex;align-items:center;gap:5px;margin:0;cursor:pointer">
+        <input type="checkbox" id="hm-all" onchange="histSelectAll(this.checked)"> 全选/全不选
+      </label>
+      <button class="danger" id="hm-del" onclick="histDelete()" disabled>🗑 删除所选</button>
+      <button onclick="openFolder('')">📂 reports 文件夹</button>
+      <button onclick="renderHistModal()">🔄 刷新</button>
+      <span style="flex:1"></span>
+      <span class="hint">📁=蒸馏技能包目录 · 点名称或 👁 查看 · 📂 打开所在文件夹</span>
+    </div>
+    <div class="mlist" id="hm-list"></div>
+  </div>
+</div>
+<script>
+let MODE="deep", CURMD="", TIMER=null;
+document.querySelectorAll(".mode").forEach(el=>el.onclick=()=>{
+  document.querySelectorAll(".mode").forEach(e=>e.classList.remove("sel"));
+  el.classList.add("sel"); MODE=el.dataset.m;
+});
+const drop=document.getElementById("drop"), fileEl=document.getElementById("file");
+drop.onclick=()=>fileEl.click();
+drop.ondragover=e=>{e.preventDefault();drop.classList.add("over")};
+drop.ondragleave=()=>drop.classList.remove("over");
+drop.ondrop=e=>{e.preventDefault();drop.classList.remove("over");
+  const fs=[...e.dataTransfer.files]; if(!fs.length)return;
+  fs.length>1?batchUpload(fs):upload(fs[0])};
+fileEl.onchange=()=>{const fs=[...fileEl.files]; if(!fs.length)return;
+  fs.length>1?batchUpload(fs):upload(fs[0]); fileEl.value=""};
+
+const optCritique=()=>document.getElementById("critique").checked;
+const optStory=()=>!document.getElementById("nostory").checked;
+
+/* ---------- 批量队列 ---------- */
+let BATCHTIMER=null, CURBATCH=null;
+const QST={distill:"萃猫蒸馏",cand:"候选素材萃取",skill:"技能包生成",wait:"等待中",parse:"解析中",ocr:"OCR 识别",map:"逐块深读",reduce:"分层汇总",
+  story:"生成故事梗概",critique:"对抗式复核",compose:"成稿",book:"分部深读",final:"成稿"};
+async function batchUpload(fs){
+  const fd=new FormData();
+  fs.forEach(f=>fd.append("file",f,f.name));
+  fd.append("mode",MODE);
+  fd.append("critique",optCritique()?"1":"0");
+  fd.append("story",optStory()?"1":"0");
+  setBusy(true,"批量入队 "+fs.length+" 个文件…");
+  try{
+    const j=await(await fetch("/api/batch",{method:"POST",body:fd})).json();
+    if(j.error){fail(j.error);return}
+    CURBATCH=j.id;
+    document.getElementById("queue").style.display="block";
+    setBusy(false);
+    document.getElementById("report").innerHTML=
+      '<div class="empty">🗂 已入队 <b>'+j.total+'</b> 个文件（'+MODE+' 模式）<br>队列在左侧串行处理，完成后点击条目即可打开报告</div>';
+    pollBatch();
+  }catch(e){fail(e.message)}
+}
+function pollBatch(){
+  if(BATCHTIMER)return;
+  BATCHTIMER=setInterval(async()=>{
+    let j;
+    try{ j=await(await fetch("/api/batch/status?id="+CURBATCH)).json(); }catch(e){return}
+    if(j.error){clearInterval(BATCHTIMER);BATCHTIMER=null;return}
+    renderQueue(j);
+    if(j.state==="done"){clearInterval(BATCHTIMER);BATCHTIMER=null;loadHist()}
+  },2000);
+}
+function renderQueue(j){
+  document.getElementById("q-sum").textContent=j.done+"/"+j.total;
+  document.getElementById("q-list").innerHTML=j.items.map(it=>{
+    let cls="",tail="",icon="◦";
+    if(it.state==="done"){cls="done";icon="✅";tail=(it.nchar||0)+"字"+(it.story_chars?" 梗概"+it.story_chars+"字":"")}
+    else if(it.state==="error"){cls="error";icon="❌";tail=esc((it.error||"失败").slice(0,16))}
+    else if(it.state==="running"){cls="running";icon="⏳";
+      tail=(QST[it.stage]||it.stage||"")+(it.stotal?" "+(it.sdone||0)+"/"+it.stotal:"")}
+    else {tail="排队中"}
+    return '<div class="qi '+cls+'" data-f="'+esc(it.file||"")+'" title="'+esc(it.name)+'">'
+      +'<span>'+icon+'</span><span class="nm">'+esc(it.name)+'</span><span class="st">'+tail+'</span></div>';
+  }).join("");
+  document.querySelectorAll("#q-list .qi.done").forEach(el=>{
+    el.onclick=()=>{ if(el.dataset.f) loadReportFile(el.dataset.f); };
+  });
+}
+
+async function upload(f){
+  const fd=new FormData();
+  fd.append("parse_only","1");
+  fd.append("file",f,f.name);
+  setBusy(true,"解析 "+f.name+" …");
+  try{
+    const r=await fetch("/api/upload",{method:"POST",body:fd});
+    const j=await r.json();
+    if(j.error){fail(j.error);return}
+    document.getElementById("text").value=j.text;
+    if(!document.getElementById("title").value)
+      document.getElementById("title").value=f.name;
+    setBusy(false);
+    const longDoc=j.nchar>20000;
+    if(longDoc) document.getElementById("critique").checked=true;   // 长文本默认开对抗复核
+    document.getElementById("report").innerHTML=
+      '<div class="empty">✅ 已解析 <b>'+j.nchar+'</b> 字（未开始）'
+      +(j.is_narrative?'<br>📖 识别为叙事文本，将自动前置「故事梗概」（≥1500字）':'')
+      +(longDoc?'<br>🧐 长文本已默认勾选「对抗式复核」（可在下方取消）':'')
+      +'<br>已为你高亮推荐模式，确认后点「开始精读」或「模式对比」</div>';
+    recommend();
+  }catch(e){fail(e.message)}
+}
+
+/* 模式推荐：输入停顿 0.8s 后问服务端 */
+let recTimer=null;
+document.getElementById("text").addEventListener("input",()=>{
+  clearTimeout(recTimer); recTimer=setTimeout(recommend,800);
+});
+async function recommend(){
+  const t=document.getElementById("text").value.trim();
+  if(t.length<50)return;
+  try{
+    const j=await(await fetch("/api/recommend",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({text:t.slice(0,20000)})})).json();
+    if(!j.mode)return;
+    document.querySelectorAll(".mode").forEach(e=>{
+      e.classList.remove("sel");
+      const r=e.querySelector(".rec"); if(r)r.remove();
+    });
+    const el=document.querySelector('.mode[data-m="'+j.mode+'"]');
+    el.classList.add("sel"); MODE=j.mode;
+    el.insertAdjacentHTML("beforeend",
+      '<div class="rec">★ 推荐 · '+esc(j.reason)+'</div>');
+  }catch(e){}
+}
+
+document.getElementById("go").onclick=submit;
+
+async function submit(){
+  const text=document.getElementById("text").value.trim();
+  const title=document.getElementById("title").value.trim();
+  if(text.length<50){alert("文本至少 50 字");return}
+  setBusy(true,"切段中…");
+  try{
+    const r=await fetch("/api/read",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({mode:MODE,title:title||"粘贴文本",text,
+        critique:optCritique(),story:optStory()})});
+    const j=await r.json();
+    if(j.error){fail(j.error);return}
+    poll(j.id);
+  }catch(e){fail(e.message)}
+}
+
+const STAGE={map:"逐块深读提取",reduce:"分层汇总",compose:"成稿",final:"成稿",
+  story:"生成故事梗概",critique:"对抗式复核",ocr:"扫描件 OCR 识别",
+  book:"分部深读",parse:"解析文件"};
+function setBusy(b,msg){
+  document.getElementById("go").disabled=b;
+  document.getElementById("progress").style.display=b?"flex":"none";
+  if(msg)document.getElementById("stage").textContent=msg;
+}
+function fail(msg){
+  setBusy(false);
+  document.getElementById("report").innerHTML='<div class="err">❌ '+esc(msg)+'</div>';
+}
+function poll(id){
+  clearInterval(TIMER);
+  TIMER=setInterval(async()=>{
+    const j=await (await fetch("/api/status?id="+id)).json();
+    if(j.error){clearInterval(TIMER);setBusy(false);fail("任务已丢失（服务可能重启过）："+j.error);return}
+    if(j.state==="error"){clearInterval(TIMER);fail(j.error);return}
+    if(j.state==="done"){clearInterval(TIMER);setBusy(false);load(id);loadHist();return}
+    setBusy(true);
+    const total=Math.max(j.total||1,1), pct=Math.round((j.done/total)*100);
+    document.getElementById("stage").textContent=STAGE[j.stage]||j.stage+" "+j.done+"/"+j.total;
+    document.getElementById("barfill").style.width=pct+"%";
+    document.getElementById("pct").textContent=j.done+"/"+j.total+" ("+pct+"%)";
+  },2000);
+}
+async function load(id){
+  const j=await (await fetch("/api/report?id="+id)).json();
+  if(j.error)return;
+  CURMD=j.md;
+  document.getElementById("report").innerHTML=render(j.md);
+  document.getElementById("actions").style.display="flex";
+}
+
+/* ---------- 模式对比（自选模式） ---------- */
+document.getElementById("cmp").onclick=()=>{
+  document.getElementById("cmp-panel").style.display=
+    document.getElementById("cmp-panel").style.display==="none"?"block":"none";
+};
+document.getElementById("cmp-go").onclick=async()=>{
+  const text=document.getElementById("text").value.trim();
+  if(text.length<50){alert("文本至少 50 字");return}
+  const modes=[...document.querySelectorAll("#cmp-modes input:checked")].map(i=>i.value);
+  if(modes.length<2){alert("至少选择 2 种模式");return}
+  document.getElementById("cmp-panel").style.display="none";
+  setBusy(true,"对比：公共深读阶段…");
+  try{
+    const r=await fetch("/api/compare",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({title:document.getElementById("title").value.trim()||"未命名",text,modes})});
+    const j=await r.json();
+    if(j.error){fail(j.error);return}
+    pollCompare(j.id,modes);
+  }catch(e){fail(e.message)}
+};
+function pollCompare(id,modes){
+  clearInterval(TIMER);
+  TIMER=setInterval(async()=>{
+    const j=await (await fetch("/api/status?id="+id)).json();
+    if(j.error){clearInterval(TIMER);setBusy(false);fail("任务已丢失（服务可能重启过）："+j.error);return}
+    if(j.state==="error"){clearInterval(TIMER);fail(j.error);return}
+    if(j.state==="done"){clearInterval(TIMER);setBusy(false);loadCompare(id);loadHist();return}
+    setBusy(true);
+    let msg,pctv;
+    if(j.stage==="map"){msg="公共深读 "+j.done+"/"+j.total;pctv=Math.round((j.done/Math.max(j.total,1))*55)}
+    else if(j.stage==="reduce"){msg="分层汇总";pctv=60}
+    else{msg=(modes?modes.length:4)+" 模式成稿 "+j.done+"/"+j.total;pctv=60+Math.round((j.done/Math.max(j.total,1))*40)}
+    document.getElementById("stage").textContent=msg;
+    document.getElementById("barfill").style.width=pctv+"%";
+    document.getElementById("pct").textContent=pctv+"%";
+  },2500);
+}
+async function loadCompare(id){
+  const j=await (await fetch("/api/report?id="+id)).json();
+  if(j.error)return;
+  CURMD=j.md;
+  const names={quick:"⚡ 快速要点",deep:"🔍 深度精读",map:"🗺️ 知识地图",
+    feynman:"🎓 大白话讲解",distill:"🧪 萃猫蒸馏",book:"📚 整书精读"};
+  const keys=Object.keys(j.reports||{}).filter(m=>names[m]);
+  const sum=(j.summary||"").trim();
+  const box=sum?('<div class="storybox"><div class="sb-h">📖 故事梗概（各模式共用 · '
+      +sum.replace(/\s/g,"").length+' 字）</div>'+render(sum)+'</div>'):'';
+  document.getElementById("report").innerHTML= box
+    +'<div class="cmp">'+keys.map(m=>
+      "<div><h2>"+names[m]+"</h2>"+render((j.reports||{})[m]||"")+"</div>").join("")+"</div>";
+  document.getElementById("actions").style.display="flex";
+  document.getElementById("report").scrollTop=0;
+}
+
+/* ---------- 重置清空（开始下一个任务） ---------- */
+document.getElementById("reset").onclick=()=>{
+  if(!confirm("清空当前输入、进度与报告视图？（已保存的报告不受影响）"))return;
+  clearInterval(TIMER);TIMER=null;clearInterval(BATCHTIMER);BATCHTIMER=null;
+  CURMD="";CURBATCH=null;
+  document.getElementById("text").value="";
+  document.getElementById("title").value="";
+  document.getElementById("cmp-panel").style.display="none";
+  document.getElementById("queue").style.display="none";
+  document.getElementById("q-list").textContent="多选文件后自动排队，单 worker 串行处理";
+  document.getElementById("q-sum").textContent="";
+  setBusy(false);
+  document.getElementById("barfill").style.width="0";
+  document.getElementById("pct").textContent="";
+  document.getElementById("stage").textContent="准备中";
+  document.getElementById("report").innerHTML=
+    '<div class="empty">左侧粘贴文本或拖入文件 → 选模式 → 开始精读<br>报告将在这里渲染</div>';
+  document.getElementById("actions").style.display="none";
+};
+
+/* ---------- 历史报告点击打开 ---------- */
+async function loadReportFile(fn){
+  const j=await (await fetch("/api/file?name="+encodeURIComponent(fn))).json();
+  if(j.error){alert(j.error);return}
+  CURMD=j.md;
+  document.getElementById("report").innerHTML=render(j.md);
+  document.getElementById("actions").style.display="flex";
+  document.getElementById("report").scrollTop=0;
+}
+function downloadMd(){
+  const b=new Blob([CURMD],{type:"text/markdown"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(b);
+  a.download=(document.getElementById("title").value||"deepread")+"_"+MODE+".md";
+  a.click();
+}
+async function copyMd(){await navigator.clipboard.writeText(CURMD);alert("已复制到剪贴板")}
+async function openFolder(name){
+  const j=await(await fetch("/api/open_folder?name="+encodeURIComponent(name||""))).json();
+  if(j.error)alert("打开失败: "+j.error);
+}
+document.getElementById("hist-open").onclick=()=>openFolder("");
+document.getElementById("hist-refresh").onclick=loadHist;
+async function loadHist(){
+  const j=await (await fetch("/api/history")).json();
+  document.getElementById("hist-list").innerHTML=j.items.length
+    ? j.items.map(i=>{
+        const icon=i.type==="dir"?"📁":"📄";
+        const act=i.type==="dir"
+          ?`openFolder('${esc(i.file)}')`
+          :`loadReportFile('${esc(i.file)}')`;
+        const size=i.type==="dir"?"技能包":fmtSize(i.size);
+        return `<div class="it" title="${esc(i.file)}" onclick="${act}">${icon} ${esc(i.file.slice(0,30))}
+          <span style="float:right;opacity:.55">${size} <span title="打开所在文件夹" style="cursor:pointer" onclick="event.stopPropagation();openFolder('${esc(i.file)}')">📂</span></span></div>`;
+      }).join("")
+    : "点击即可打开报告";
+}
+function fmtSize(n){
+  if(n>1048576)return (n/1048576).toFixed(1)+"M";
+  if(n>1024)return Math.round(n/1024)+"K";
+  return n+"B";
+}
+
+/* ---------- 历史报告管理弹层 ---------- */
+let HISTITEMS=[], HISTSEL=new Set();
+document.getElementById("hist-manage").onclick=openHistModal;
+document.getElementById("hist-mask").addEventListener("click",e=>{
+  if(e.target.id==="hist-mask")closeHistModal();});
+function openHistModal(){renderHistModal();
+  document.getElementById("hist-mask").classList.add("show")}
+function closeHistModal(){document.getElementById("hist-mask").classList.remove("show")}
+async function renderHistModal(){
+  try{
+    const j=await(await fetch("/api/history")).json();
+    HISTITEMS=j.items||[];HISTSEL.clear();
+  }catch(e){HISTITEMS=[]}
+  drawHistModal();
+}
+function drawHistModal(){
+  document.getElementById("hm-count").textContent=
+    HISTSEL.size?`已选 ${HISTSEL.size} / ${HISTITEMS.length} 项`:`共 ${HISTITEMS.length} 项`;
+  document.getElementById("hm-del").disabled=!HISTSEL.size;
+  document.getElementById("hm-all").checked=
+    HISTITEMS.length>0&&HISTSEL.size===HISTITEMS.length;
+  document.getElementById("hm-list").innerHTML=HISTITEMS.length
+    ? HISTITEMS.map(i=>{
+        const icon=i.type==="dir"?"📁":"📄";
+        const size=i.type==="dir"?"技能包":fmtSize(i.size);
+        const f=esc(i.file), t=i.type||"file";
+        const d=new Date(i.mtime), ds=`${d.getMonth()+1}-${d.getDate()} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
+        return `<div class="mrow">
+          <input type="checkbox" ${HISTSEL.has(i.file)?"checked":""} onchange="histToggle('${f}',this.checked)">
+          <span>${icon}</span>
+          <span class="nm" title="${f}" onclick="histView('${f}','${t}')">${esc(i.file)}</span>
+          <span class="meta">${size} · ${ds}</span>
+          <span class="act" title="查看" onclick="histView('${f}','${t}')">👁</span>
+          <span class="act" title="打开所在文件夹" onclick="openFolder('${f}')">📂</span>
+        </div>`;
+      }).join("")
+    : '<div class="hint" style="padding:20px">暂无报告</div>';
+}
+function histToggle(f,on){on?HISTSEL.add(f):HISTSEL.delete(f);drawHistModal()}
+function histSelectAll(on){
+  HISTSEL=on?new Set(HISTITEMS.map(i=>i.file)):new Set();drawHistModal()}
+function histView(f,t){
+  if(t==="dir"){openFolder(f);return}
+  loadReportFile(f);closeHistModal();
+}
+async function histDelete(){
+  if(!HISTSEL.size)return;
+  const dirs=[...HISTSEL].filter(f=>(HISTITEMS.find(i=>i.file===f)||{}).type==="dir");
+  let msg=`确定删除选中的 ${HISTSEL.size} 项？此操作不可恢复！`;
+  if(dirs.length)msg+=`\n（含 ${dirs.length} 个蒸馏技能包目录，整个目录及其 SKILL.md 将一并删除）`;
+  if(!confirm(msg))return;
+  try{
+    const r=await(await fetch("/api/delete",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({names:[...HISTSEL]})})).json();
+    if(r.error){alert("删除失败: "+r.error);return}
+    if(r.errors&&r.errors.length)alert("部分删除失败:\n"+r.errors.join("\n"));
+  }catch(e){alert("删除失败: "+e.message)}
+  loadHist();renderHistModal();
+}
+function esc(s){return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
+
+/* 极简 Markdown 渲染（标题/列表/表格/引用/代码/加粗） */
+function render(md){
+  const lines=md.split("\n"); let html="", inCode=false, inTable=false, list=null;
+  const closeList=()=>{if(list){html+="</"+list+">";list=null}};
+  const closeTable=()=>{if(inTable){html+="</table>";inTable=false}};
+  const inline=s=>esc(s)
+    .replace(/\*\*(.+?)\*\*/g,"<b>$1</b>")
+    .replace(/`([^`]+)`/g,"<code>$1</code>")
+    .replace(/\[(.+?)\]\((.+?)\)/g,'<a href="$2" style="color:var(--accent)">$1</a>');
+  for(const raw of lines){
+    const line=raw.trimEnd();
+    if(line.startsWith("```")){closeList();closeTable();
+      if(inCode){html+="</code></pre>";inCode=false}else{html+="<pre><code>";inCode=true}
+      continue}
+    if(inCode){html+=esc(raw)+"\n";continue}
+    const h=line.match(/^(#{1,4})\s+(.*)/);
+    if(h){closeList();closeTable();
+      const lv=Math.min(h[1].length,4);
+      html+= lv===1?("<h1>"+inline(h[2])+"</h1>"):("<h2>"+inline(h[2])+"</h2>");continue}
+    if(/^\|.*\|$/.test(line)){closeList();
+      const cells=line.slice(1,-1).split("|").map(c=>inline(c.trim()));
+      if(cells.every(c=>/^[-: ]*$/.test(c.replace(/&[a-z]+;/g,""))))continue;
+      if(!inTable){html+='<table><tr>'+cells.map(c=>"<th>"+c+"</th>").join("")+"</tr>";inTable=true}
+      else html+="<tr>"+cells.map(c=>"<td>"+c+"</td>").join("")+"</tr>";
+      continue}
+    closeTable();
+    const q=line.match(/^>\s?(.*)/);
+    if(q){closeList();html+="<blockquote>"+inline(q[1])+"</blockquote>";continue}
+    const ul=line.match(/^[-*]\s+(.*)/), ol=line.match(/^(\d+)[.、]\s+(.*)/);
+    if(ul){if(list!=="ul"){closeList();html+="<ul>";list="ul"}html+="<li>"+inline(ul[1])+"</li>";continue}
+    if(ol){if(list!=="ol"){closeList();html+='<ol start="'+parseInt(ol[1])+'">';list="ol"}html+="<li>"+inline(ol[2])+"</li>";continue}
+    closeList();
+    if(line==="---"||line==="***"){html+="<hr>";continue}
+    if(line==="")continue;
+    html+="<p>"+inline(line)+"</p>";
+  }
+  closeList();closeTable();
+  if(inCode)html+="</code></pre>";
+  return html;
+}
+(async()=>{ // init
+  try{const j=await (await fetch("/api/health")).json();
+    const p=document.getElementById("model-pill");
+    p.textContent="● "+j.model;p.classList.add("ok");
+  }catch(e){document.getElementById("model-pill").textContent="● 服务未连接"}
+  loadHist();
+})();
+</script>
+</body>
+</html>

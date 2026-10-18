@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# 本地生成物与版权书源（不入远程仓）
+reports/
+source_input/
+data/
+_tmp*
+*.pdf
+
+# 工作区本地记忆
+.workbuddy/
+
+# 运行时
+*.log
+.DS_Store
+Thumbs.db
