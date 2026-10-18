@@ -60,18 +60,86 @@ def _save_report(md: str, title: str, tag: str) -> str:
     return fname
 
 
-def _run_single(jid, text, title, mode, critique=False, story=True, dtype=""):
-    job = JOBS[jid]
+# 阶段元数据：label 前端展示名 / desc 该步骤在做什么 / out 成果描述模板
+STAGE_INFO = {
+    "parse":    ("解析文件", "识别格式并提取纯文本；扫描件自动转视觉 OCR 逐页转写",
+                 "提取全文"),
+    "ocr":      ("OCR 识别", "图片型页面走 qwen3-vl 逐页转写", "转写 {total} 页"),
+    "wait":     ("排队等待", "批量队列单 worker 串行，前面的任务处理中", ""),
+    "map":      ("逐块深读", "把全文切成约 7500 字/块，逐块提取要点卡片、数据与金句候选",
+                 "产出 {total} 块卡片"),
+    "reduce":   ("分层汇总", "把各块卡片按 5 块一组归并为分段小结，逐层收敛",
+                 "归并为 {total} 段小结"),
+    "story":    ("生成故事梗概", "基于原文分批叙述再合成 600-1400 字归纳式梗概",
+                 "{total} 批原文 → 合成"),
+    "cand":     ("候选素材萃取", "逐块原文萃取原则/方法步骤/术语/禁忌，每条带原文逐字摘录",
+                 "萃取 {total} 块候选素材"),
+    "distill":  ("全书骨架与聚类", "生成全书骨架（主旨/结构/主张/概念/盲点），按使用场景聚类成技能方案",
+                 "骨架 + 聚类方案"),
+    "skill":    ("生成技能包", "按聚类方案逐个产出 SKILL.md（核心判断/怎么做/判断标准/出处）",
+                 "{total} 个技能包"),
+    "book":     ("分部深读", "按章节把整书分成若干部，逐部精读", "{total} 部"),
+    "compose":  ("成稿", "按模式结构组装最终报告", ""),
+    "final":    ("成稿", "按模式结构组装最终报告", ""),
+    "critique": ("对抗式复核", "四视角评审挑刺 + 主编回应", "4 视角评审"),
+}
+
+
+def _make_progress(job: dict):
+    """步骤级遥测：阶段切换时关闭上一步（记耗时），并记录各步起止/进度。"""
+    cur = {"stage": None}
 
     def progress(stage, done, total):
+        now = time.time()
         with JOB_LOCK:
+            steps = job.setdefault("steps", [])
+            if stage != cur["stage"]:
+                if steps and steps[-1].get("running"):
+                    steps[-1]["running"] = False
+                    steps[-1]["secs"] = round(now - steps[-1]["t0"], 1)
+                label, desc, out = STAGE_INFO.get(stage, (stage, "", ""))
+                steps.append({"stage": stage, "label": label, "desc": desc,
+                              "out": out, "done": done, "total": total,
+                              "t0": now, "running": True})
+                cur["stage"] = stage
+            s = steps[-1]
+            s["done"], s["total"] = done, total
+            s["elapsed"] = round(now - s["t0"], 1)
             job.update(stage=stage, done=done, total=total)
+    return progress
+
+
+def _steps_payload(job: dict) -> list:
+    """把 job['steps'] 压成前端渲染所需的最小结构。"""
+    out = []
+    for s in job.get("steps") or []:
+        it = {"stage": s["stage"], "label": s["label"], "desc": s["desc"],
+              "out": s.get("out") or "", "done": s["done"],
+              "total": s["total"], "running": bool(s.get("running"))}
+        it["elapsed" if it["running"] else "secs"] = \
+            s.get("elapsed") if it["running"] else s.get("secs") or 0
+        out.append(it)
+    return out
+
+
+def _close_steps(job: dict):
+    """任务结束（done/error）时关闭最后一个未闭合步骤，记下耗时。"""
+    steps = job.get("steps") or []
+    if steps and steps[-1].get("running"):
+        steps[-1]["running"] = False
+        steps[-1]["secs"] = round(time.time() - steps[-1]["t0"], 1)
+
+
+def _run_single(jid, text, title, mode, critique=False, story=True, dtype=""):
+    job = JOBS[jid]
+    progress = _make_progress(job)
     try:
         md, st = deepread.deepread_text(text, title, mode, progress=progress,
                                         critique=critique, story=story,
                                         dtype=dtype)
         fname = _save_report(md, title, mode)
         with JOB_LOCK:
+            _close_steps(job)
             job.update(state="done", md=md, file=fname,
                        nchar=st["nchar"], nchunks=st.get("nchunks", 0),
                        is_narrative=st.get("is_narrative", False),
@@ -80,25 +148,25 @@ def _run_single(jid, text, title, mode, critique=False, story=True, dtype=""):
                        story_chars=deepread.text_len(st.get("story_summary", "")))
     except Exception as e:  # noqa: BLE001 —— 任务失败要反馈给前端
         with JOB_LOCK:
+            _close_steps(job)
             job.update(state="error", error=str(e)[:300])
 
 
 def _run_compare(jid, text, title, mode=None, critique=False, story=True,
                  dtype="", modes=None):
     job = JOBS[jid]
-
-    def progress(stage, done, total):
-        with JOB_LOCK:
-            job.update(stage=stage, done=done, total=total)
+    progress = _make_progress(job)
     try:
         reports, merged, summary = deepread.deepread_compare(
             text, title, progress=progress, dtype=dtype, modes=modes)
         fname = _save_report(merged, title, "对比")
         with JOB_LOCK:
+            _close_steps(job)
             job.update(state="done", md=merged, reports=reports, file=fname,
                        nchar=len(text), summary=summary)
     except Exception as e:  # noqa: BLE001
         with JOB_LOCK:
+            _close_steps(job)
             job.update(state="error", error=str(e)[:300])
 
 
@@ -245,7 +313,9 @@ class Handler(BaseHTTPRequestHandler):
                     keys = ("state", "stage", "done", "total", "error",
                             "title", "mode", "nchar", "nchunks", "file",
                             "is_narrative")
-                    self._json({k: job.get(k) for k in keys})
+                    out = {k: job.get(k) for k in keys}
+                    out["steps"] = _steps_payload(job)
+                    self._json(out)
         elif u.path == "/api/report":
             job = JOBS.get((q.get("id") or [""])[0])
             if not job:

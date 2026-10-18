@@ -84,6 +84,16 @@
   #hist h3{font-size:12px;color:var(--muted);margin-bottom:8px}
   #hist .it{font-size:11.5px;color:var(--muted);padding:4px 6px;border-radius:6px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   #hist .it:hover{background:var(--card);color:var(--ink)}
+  /* ---------- 步骤遥测 ---------- */
+  #stageinfo{padding:6px 2px 0;font-size:11.5px;color:var(--muted);line-height:1.6}
+  #stepsbox{margin-top:10px;padding-top:8px;border-top:1px solid var(--border)}
+  #stepsbox h3{font-size:11px;color:var(--muted);margin:0 0 6px}
+  .stp{display:flex;gap:8px;align-items:baseline;font-size:11px;padding:3px 0;border-bottom:1px dashed var(--border);color:var(--muted)}
+  .stp:last-child{border-bottom:none}
+  .stp .lb{color:var(--ink);font-weight:600;white-space:nowrap}
+  .stp .dt{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .stp .ot{white-space:nowrap;color:var(--ok)}
+  .stp .tm{white-space:nowrap}
   /* ---------- 历史报告管理弹层 ---------- */
   .modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:50}
   .modal-mask.show{display:flex}
@@ -177,6 +187,11 @@
   </div>
   <div id="right">
     <div id="progress"><span id="stage">准备中</span><div class="bar"><i id="barfill"></i></div><span id="pct"></span></div>
+    <div id="stageinfo" style="display:none"></div>
+    <div id="stepsbox" style="display:none">
+      <h3>📋 工作清单（本任务的步骤与耗时）</h3>
+      <div id="steps-list"></div>
+    </div>
     <div id="report"><div class="empty">左侧粘贴文本或拖入文件 → 选模式 → 开始精读<br>报告将在这里渲染</div></div>
     <div id="actions" style="display:none">
       <button onclick="downloadMd()">下载 Markdown</button>
@@ -351,6 +366,30 @@ function fail(msg){
   setBusy(false);
   document.getElementById("report").innerHTML='<div class="err">❌ '+esc(msg)+'</div>';
 }
+function fmtDur(s){s=Math.round(s||0);if(s<60)return s+"秒";if(s<3600)return Math.floor(s/60)+"分"+(s%60?String(s%60)+"秒":"");return Math.floor(s/3600)+"时"+Math.round((s%3600)/60)+"分"}
+function renderSteps(steps){
+  const box=document.getElementById("stepsbox"),si=document.getElementById("stageinfo");
+  if(!steps||!steps.length){box.style.display="none";si.style.display="none";return}
+  box.style.display="block";
+  document.getElementById("steps-list").innerHTML=steps.map(s=>{
+    let ic,tm;
+    if(s.running){ic="⏳";
+      const eta=s.done>0?fmtDur(s.elapsed/s.done*(s.total-s.done)):"估测中…";
+      tm=`${s.done}/${s.total} · 已用 ${fmtDur(s.elapsed)} · 预计还需 ${eta}`;}
+    else{ic="✅";tm="耗时 "+fmtDur(s.secs)}
+    const out=s.out?esc(s.out.replace("{total}",s.total)):"";
+    return `<div class="stp"><span>${ic}</span><span class="lb">${esc(s.label)}</span>`+
+      `<span class="dt" title="${esc(s.desc)}">${esc(s.desc)}</span>`+
+      `<span class="ot">${out}</span><span class="tm">${tm}</span></div>`;
+  }).join("");
+  const cur=steps[steps.length-1];
+  if(cur&&cur.running){
+    const eta=cur.done>0?fmtDur(cur.elapsed/cur.done*(cur.total-cur.done)):"估测中…";
+    si.style.display="block";
+    si.innerHTML=`<b>${esc(cur.label)}</b> — ${esc(cur.desc)}（${cur.done}/${cur.total}，预计还需 ${eta}）`;
+  }else si.style.display="none";
+}
+
 function poll(id){
   clearInterval(TIMER);
   TIMER=setInterval(async()=>{
@@ -363,6 +402,7 @@ function poll(id){
     document.getElementById("stage").textContent=STAGE[j.stage]||j.stage+" "+j.done+"/"+j.total;
     document.getElementById("barfill").style.width=pct+"%";
     document.getElementById("pct").textContent=j.done+"/"+j.total+" ("+pct+"%)";
+    renderSteps(j.steps);
   },2000);
 }
 async function load(id){
@@ -409,6 +449,7 @@ function pollCompare(id,modes){
     document.getElementById("stage").textContent=msg;
     document.getElementById("barfill").style.width=pctv+"%";
     document.getElementById("pct").textContent=pctv+"%";
+    renderSteps(j.steps);
   },2500);
 }
 async function loadCompare(id){
@@ -446,6 +487,8 @@ document.getElementById("reset").onclick=()=>{
   document.getElementById("report").innerHTML=
     '<div class="empty">左侧粘贴文本或拖入文件 → 选模式 → 开始精读<br>报告将在这里渲染</div>';
   document.getElementById("actions").style.display="none";
+  document.getElementById("stepsbox").style.display="none";
+  document.getElementById("stageinfo").style.display="none";
 };
 
 /* ---------- 历史报告点击打开 ---------- */
