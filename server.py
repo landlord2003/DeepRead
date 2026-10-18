@@ -44,7 +44,7 @@ QUEUE_LOCK = threading.Lock()
 _worker_started = False
 MAX_BATCH_ITEMS = int(os.environ.get("DEEPREAD_MAX_BATCH", "20"))
 MAX_ITEM_CHARS = int(os.environ.get("DEEPREAD_MAX_ITEM_CHARS", "3000000"))
-ALLOWED_EXT = (".txt", ".md", ".markdown", ".pdf", ".docx") + deepread.OCR_EXTS
+ALLOWED_EXT = (".txt", ".md", ".markdown", ".pdf", ".docx", ".epub") + deepread.OCR_EXTS
 
 
 def _save_report(md: str, title: str, tag: str) -> str:

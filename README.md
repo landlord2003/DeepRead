@@ -55,6 +55,8 @@ python server.py               # 默认 127.0.0.1:8790
 
 浏览器打开 `http://127.0.0.1:8790` → 左侧粘贴文本或拖入文件 → 选模式 → 开始精读。
 
+支持格式：**txt / md / pdf（含扫描件 OCR 兜底）/ docx / epub** / 图片（png/jpg/webp/bmp，走视觉 OCR）。EPUB 采用纯标准库解析（spine 顺序抽取正文），DRM 加密书暂不支持。
+
 ### 命令行用法
 
 ```bash

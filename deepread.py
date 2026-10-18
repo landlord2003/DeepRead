@@ -102,9 +102,11 @@ def read_any(path: str, ocr: bool = True, progress=None) -> str:
         return read_pdf(path, ocr=ocr, progress=progress)
     if ext == ".docx":
         return read_docx(path)
+    if ext == ".epub":
+        return read_epub(path)
     if ext in OCR_EXTS:
         return ocr_image(path, progress=progress)
-    raise ValueError(f"暂不支持的格式: {ext}（支持 txt/md/pdf/docx/图片）")
+    raise ValueError(f"暂不支持的格式: {ext}（支持 txt/md/pdf/docx/epub/图片）")
 
 
 def read_pdf(path: str, ocr: bool = True, progress=None) -> str:
@@ -136,6 +138,57 @@ def _looks_scanned(text: str, npages: int) -> bool:
     if npages <= 0:
         return False
     return text_len(text) / npages < OCR_MIN_DENSITY
+
+
+def read_epub(path: str) -> str:
+    """epub = zip 包：container.xml → OPF → 按 spine 顺序抽取 XHTML 正文。
+    纯标准库实现；DRM 加密书会因读不到明文 XHTML 而报错。"""
+    import zipfile
+    import posixpath
+    import html as html_mod
+    from urllib.parse import unquote
+    import xml.etree.ElementTree as ET
+    with zipfile.ZipFile(path) as z:
+        container = z.read("META-INF/container.xml").decode("utf-8", "ignore")
+        m = re.search(r'full-path="([^"]+)"', container)
+        if not m:
+            raise ValueError("epub 结构异常：container.xml 未指向 OPF")
+        opf_path = posixpath.normpath(m.group(1))
+        root = ET.fromstring(z.read(opf_path))
+        base = posixpath.dirname(opf_path)
+        manifest, spine = {}, []
+        for el in root.iter():
+            tag = el.tag.rsplit("}", 1)[-1]
+            if tag == "item" and el.get("id"):
+                manifest[el.get("id")] = (el.get("href") or "",
+                                          el.get("media-type") or "")
+            elif tag == "itemref" and el.get("idref"):
+                spine.append(el.get("idref"))
+        parts = []
+        for idref in spine:
+            href, mt = manifest.get(idref, ("", ""))
+            if not href or ("html" not in mt.lower()
+                            and not href.lower().endswith((".xhtml", ".html",
+                                                           ".htm"))):
+                continue                       # 跳过 css/ncx/图片等资源项
+            name = posixpath.normpath(
+                posixpath.join(base, unquote(href)))
+            try:
+                raw = z.read(name).decode("utf-8", "ignore")
+            except KeyError:
+                continue
+            raw = re.sub(r"(?is)<(style|script)[^>]*>.*?</\1>", "", raw)
+            raw = re.sub(r"(?i)<br\s*/?>", "\n", raw)
+            raw = re.sub(r"(?i)</(p|div|h[1-6]|li|tr|blockquote)>", "\n", raw)
+            text = html_mod.unescape(re.sub(r"<[^>]+>", "", raw))
+            body = "\n".join(ln.strip() for ln in text.splitlines()
+                             if ln.strip())
+            if body:
+                parts.append(body)
+    out = "\n\n".join(parts)
+    if text_len(out) < 50:
+        raise ValueError("epub 正文过少——可能是 DRM 加密或纯图片电子书，暂不支持")
+    return out
 
 
 def read_docx(path: str) -> str:
