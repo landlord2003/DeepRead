@@ -47,6 +47,7 @@ source venv/bin/activate       # Linux / macOS
 
 # 2) 装依赖（仅 pypdfium2 + pillow，其余全是标准库）
 pip install -r requirements.txt
+# 国内网络可加镜像：pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple
 
 # 3) 启动
 python server.py               # 默认 127.0.0.1:8790
