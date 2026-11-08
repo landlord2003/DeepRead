@@ -2,7 +2,34 @@
 
 > 交接日期：2026-10-16 23:20 ｜ 移交人：WorkBuddy 伙计（主空间）｜ 上级文档：PROJECT.md
 > **接手第一步：读完 PROJECT.md 再回来读这份。本服务可能正在运行（127.0.0.1:8790），动代码前先确认。**
-> 当前版本 **v0.4**（2026-10-17：类型自适应精读，见 PROJECT.md §二）。
+> 当前版本 **v0.6**（2026-10-24：三 skill 交叉整合补全，见 §0.6；v0.5 嫁接三件套见 §0.5；v0.4 类型自适应见 PROJECT.md §二）。
+
+## 0.6 v0.6 更新（2026-10-24 下午，交叉整合补全——老吴指出 v0.5 是"一对一"点状嫁接后重做）
+
+**缺口一：persona 三件套**
+1. **cangjie → persona**：`PERSONA_PROMPT` mental_models 升级 RIA 结构（trigger 触发场景 / steps 操作步骤 2-4 步 / pass_criteria 验收标准 / misuse 常见误用），渲染带 🔔🪜✅⚠️ 图标；硬性要求 RIA 字段从素材实际做法归纳、撑不出步骤如实留空数组；渲染兼容旧 usage 字段。
+2. **nuwa → persona**：`PERSONA_VALIDATE_PROMPT` 三重验证（跨域复现力/问题生成力/认知排他性，各 1-5 分+必须引卡内条目作证据，PASS/REVISE/FAIL）——对**最终卡**验证，写进报告 `_persona_validation_md` 与 认知卡.json 的 `validation` 字段；验证结论只上报不自动改写。
+3. **darwin → persona**：`PERSONA_EVAL_PROMPT` 出 3 条用例（2 正常 + 1 边界拒答），失败退化确定性用例；接共享评测器。
+
+**缺口二：darwin 共享评测闭环**（此前 darwin_eval.json 只写不跑）
+- `_darwin_evaluate(skills_md, eval_cases, model, progress)`：每用例「装卡作答（DARWIN_ANSWER_SYSTEM）→ rubric 打分（DARWIN_SCORE_PROMPT）」，distill 与 persona 共用。
+- 低分重生成一代：均分 < `DARWIN_REGEN_THRESHOLD`(3.0) 的能力带失败反馈重生成（`DARWIN_FIX_NOTE`，distill 重写技能包 SKILL.md、persona 重生成整卡），最多 `DARWIN_REGEN_MAX`(3) 个，复评后覆盖结果。
+- 产物 `darwin_eval_result.json`（darwin-skill 可接力）+ 报告尾部 `_darwin_render` 评测表（🟢≥4/🟡≥3/🔴<3 + 自评偏差免责声明）；structured 增 `darwin_eval_avg` / `darwin_regenerated`。
+- 进度阶段名：`darwineval` / `personaeval` / `regen` / `nuwacheck`（QST 已加）。
+- **实测（1,100 字访谈 392s）**：RIA 卡质量高（时间账/复盘/三年清单三模型的步骤与验收全部忠实原文）；三重验证 PASS 且跨域验证 4/5 真指出三年清单在快变领域断裂；首跑评测器因花括号 bug 全 0 分**意外验证了低分重生成路径真实触发**；修复后单测 avg 5.0（边界拒答正确判达标）。
+- **⚠️ 大坑（同款第二次踩）**：**prompt 内嵌 JSON 模板 + `.format()` = 必炸**。DARWIN_SCORE_PROMPT 首版单花括号 → `{"score"...}` 被当占位符 → KeyError → 评分全 0。规则：`.format()` 的 prompt 里 JSON 一律 `{{ }}`；`.replace()` 传参的 prompt 里 JSON 用单 `{ }`。
+- **诚实边界**：本机 14b 自评"既当运动员又当裁判"，存在乐观偏差；正式进化把 darwin_eval.json + darwin_eval_result.json 交给 darwin-skill 盲测。
+
+## 0.5 v0.5 更新（2026-10-24，skill 嫁接三件套）
+
+老吴拍板把 10-23 装的三个 skill（nuwa/cangjie/darwin）真正整合进 DeepRead。**注意：DeepRead 原有的「萃猫蒸馏」distill 模式（10-22 实现）对标的是 cuimao-translator，与 cangjie 是撞车不是移植**——v0.5 才是真正嫁接：
+
+1. **cangjie → distill 升级**：`DISTILL_SKILL_PROMPT` 技能卡模板升级为 **RIA 六段结构**（`## R 触发场景 / ## 核心判断 / ## I 操作步骤 / ## A 案例 / ## E 验收标准 / ## B 常见错误 / ## 什么时候不该用它 / ## 出处`）。A 段无书中实例时允许合成演练但必须标注〔合成演练〕；E 段要求可检验判据（无数值不硬造）。旧版六节名（什么时候用它/怎么做/判断标准…）已废弃。
+2. **darwin → distill 闭环**：蒸馏落盘时一次 LLM 调用生成 `darwin_eval.json`（每技能 2 用例：正常请求 + 边界/误用请求，expected 带书中判据），LLM 失败退化为确定性用例（每技能 1 条，不阻断）。`structured["darwin_eval_n"]` 记录用例数；「怎么用.md」与报告均注明喂给 darwin-skill 的方法。组装函数 `_distill_eval_json`，进度阶段名 `eval`。
+3. **nuwa → persona 人物精读（新模式）**：`deepread_persona()`——访谈/传记/自述 → 认知操作系统卡（身份底色/思维框架 3-5/决策模式/表达 DNA/反共识/盲点争议/金句）。**金句回原文逐字校验**（复用蒸馏防编造底线，报告标 ✅/⚠️）；产物三件套落 `reports/persona_*/`：SKILL.md（frontmatter=人物角色卡，可直接导入 AI 助手）+ 认知卡.json + 报告。已注册 `ALL_MODES`、`deepread_text` 分发、CLI（choices 自动）、UI 模式卡/QST 阶段名/历史名映射。
+   - **实测**：1,100 字访谈全流程通过（类型识别 speech 0.75 → Stage B/C → 认知卡）；产物含 persona 卡。
+   - **坑**：PERSONA_PROMPT 内嵌 JSON 模板，**不能用 `.format()`**（单个 `}` 触发 ValueError），已改 `.replace("{title}",...)`——后续改这个 prompt 千万别改回 format。
+4. 三个 skill 的关系图：nuwa 蒸人（persona）｜cangjie 蒸书（distill RIA）｜darwin 进化两者产物（darwin_eval.json）。
 
 ## 0. Owner 偏好（必须遵守）
 
@@ -86,6 +113,8 @@
 - [ ] **开机自启**（wb-local-service-ops 规范）—— **老吴指示本轮不做**
 - [ ] **代码 git 化**：建仓推 Gitee（landlord2003/DeepRead），.gitignore 排除 venv/reports，远端零令牌（内联用完即清）
 - [ ] 可选增强：梗概人物身份准确度（把原文片段一并喂入，成本翻倍）；book 模式断点续跑（长任务中断即全废）
+- [ ] v0.5 待回归：distill RIA 模板升级后还没跑过整本书（下次蒸馏方法类书时核对六段齐全）；persona 大文本（>3 万字访谈）未实测
+- [ ] darwin_eval.json 目前只有用例生成，执行评测在 crawl4ai/skill_distill.py 的 `--evaluate`（两者格式一致，必要时互认）
 
 ## 6. 验收标准（改完任何东西）
 

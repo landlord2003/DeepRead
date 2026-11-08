@@ -16,6 +16,7 @@ v0.3 新增
 """
 import argparse
 import base64
+import hashlib
 import io
 import json
 import os
@@ -55,7 +56,7 @@ BOOK_PART_MIN = int(os.environ.get("DEEPREAD_BOOK_PART_MIN", "900"))     # 每�
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 MODES = ("quick", "deep", "map", "feynman", "distill")   # 模式对比可自选的基础模式
-ALL_MODES = MODES + ("book",)
+ALL_MODES = MODES + ("book", "notes", "persona")
 
 
 # ================================================================ 工具
@@ -140,6 +141,18 @@ def _looks_scanned(text: str, npages: int) -> bool:
     return text_len(text) / npages < OCR_MIN_DENSITY
 
 
+def _is_toc_doc(text: str) -> bool:
+    """判断一个文档是否主要是目录/索引页（≥50% 行为"标题…页码"样式）。
+    只认点引导符（.. 或 … 或连续全角空格），裸空格+数字不算，避免误伤正文。"""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 5:
+        return False
+    pat = re.compile(
+        r"^.{1,80}?(\.{2,}|…{1,}|　{2,}|={3,})\s*[0-9]{1,4}$")
+    toc = sum(1 for ln in lines if pat.match(ln))
+    return toc / len(lines) >= 0.5
+
+
 def read_epub(path: str) -> str:
     """epub = zip 包：container.xml → OPF → 按 spine 顺序抽取 XHTML 正文。
     纯标准库实现；DRM 加密书会因读不到明文 XHTML 而报错。"""
@@ -183,8 +196,9 @@ def read_epub(path: str) -> str:
             text = html_mod.unescape(re.sub(r"<[^>]+>", "", raw))
             body = "\n".join(ln.strip() for ln in text.splitlines()
                              if ln.strip())
-            if body:
-                parts.append(body)
+            if not body or _is_toc_doc(body):
+                continue                       # 跳过纯目录/索引文档
+            parts.append(body)
     out = "\n\n".join(parts)
     if text_len(out) < 50:
         raise ValueError("epub 正文过少——可能是 DRM 加密或纯图片电子书，暂不支持")
@@ -1266,7 +1280,8 @@ def _facts_hint(core: dict) -> str:
 # ================================================================ pipeline
 
 def pipeline_core(text: str, title: str, model: str = MODEL, progress=None,
-                  dtype: str = ""):
+                  dtype: str = "", cache_file: str = "",
+                  base_meta: dict = None):
     """Stage A/B/C：切块→逐块提取→间隔汇总，产出四种模式共用的中间产物。"""
     text = re.sub(r"[ \t]+", " ", text).strip()
     nchar = len(text)
@@ -1278,8 +1293,22 @@ def pipeline_core(text: str, title: str, model: str = MODEL, progress=None,
     chunks = split_chunks(text)
     progress("map", 0, len(chunks))
 
-    cards = []
+    # 断点续跑：复用缓存中已完成的卡片，只深读剩余块
+    base_meta = base_meta or {}
+    cards = [c for c in (base_meta.get("cards") or []) if isinstance(c, dict)]
+    if cards:
+        print(f"[cache] 断点续跑：已有 {len(cards)}/{len(chunks)} 块卡片，"
+              "跳过对应深读")
+
+    def _save():
+        if cache_file:
+            _core_cache_save(cache_file, {**base_meta, "v": 1,
+                                          "cards": cards, "intervals": []})
+
     for i, ch in enumerate(chunks):
+        if i < len(cards):                       # 已有卡片 → 只补进度不重算
+            progress("map", i + 1, len(chunks))
+            continue
         raw = chat(MAP_PROMPT.replace("{focus}", focus).replace("{chunk}", ch),
                    system=MAP_SYSTEM, json_mode=True, model=model,
                    num_ctx=4096)   # 短块小 ctx：KV cache 省 2GB+，防 12GB 卡换页
@@ -1289,17 +1318,25 @@ def pipeline_core(text: str, title: str, model: str = MODEL, progress=None,
             cards.append({"points": [], "entities": [], "quotes": [],
                           "data": [], "relations": [],
                           "_raw": raw[:500]})
+        _save()                                  # 每块落盘：中断可续
         progress("map", i + 1, len(chunks))
 
-    intervals = []
-    for a in range(0, len(cards), INTERVAL):
-        part = cards[a:a + INTERVAL]
-        raw = chat(_INTERVAL_TMPL.format(
-            title=title, a=a + 1, b=a + len(part),
-            cards=json.dumps(part, ensure_ascii=False)[:9000]),
-            model=model, num_ctx=8192)
-        intervals.append(f"[第{a+1}-{a+len(part)}段] {raw}")
+    cached_intervals = (base_meta.get("intervals") or [])
+    if cached_intervals:
+        intervals = cached_intervals             # 完整命中（保险分支）
+    else:
+        intervals = []
+        for a in range(0, len(cards), INTERVAL):
+            part = cards[a:a + INTERVAL]
+            raw = chat(_INTERVAL_TMPL.format(
+                title=title, a=a + 1, b=a + len(part),
+                cards=json.dumps(part, ensure_ascii=False)[:9000]),
+                model=model, num_ctx=8192)
+            intervals.append(f"[第{a+1}-{a+len(part)}段] {raw}")
     progress("reduce", len(intervals), len(intervals))
+    if cache_file:
+        _core_cache_save(cache_file, {**base_meta, "v": 1,
+                                      "cards": cards, "intervals": intervals})
 
     return {"title": title, "nchar": nchar, "chunks": chunks,
             "cards": cards, "intervals": intervals, "model": model}
@@ -1753,29 +1790,109 @@ def adversarial_review(core: dict, report: str, model: str = MODEL,
 
 # ================================================================ 入口
 
+# ---------------------------------------------------------------- 核心缓存
+CORE_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "data", "core_cache")
+
+
+def _core_cache_path(text: str, model: str) -> str:
+    """缓存键 = 模型 + 全文哈希（换模型/换文本自动失效）。"""
+    h = hashlib.sha1((model + "\n" + text).encode("utf-8")).hexdigest()[:20]
+    return os.path.join(CORE_CACHE_DIR, f"{h}.json")
+
+
+def _core_cache_load(path: str):
+    """读缓存。损坏/版本不符/环境禁用一律返回 None——缓存只做加速，永不引入新失败面。"""
+    if os.environ.get("DEEPREAD_NO_CACHE"):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("v") == 1 and isinstance(d.get("cards"), list):
+            return d
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _core_cache_save(path: str, data: dict):
+    """原子落盘（tmp + os.replace），失败静默——不因缓存中断任务。"""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def _prepare_core(text: str, title: str, model: str, mode: str, progress=None,
                   story: bool = True, dtype: str = "") -> dict:
-    """公共深读 + 类型识别 + 梗概 + 金句校验。dtype 非空则跳过自动识别。"""
+    """公共深读 + 类型识别 + 梗概 + 金句校验。dtype 非空则跳过自动识别。
+    深读/汇总结果按 (模型,全文) 缓存：命中跳过、部分命中断点续跑；
+    手动 dtype 与缓存不符时弃缓存重算，能力不受影响。"""
+    cache_file = _core_cache_path(text, model)
+    cached = _core_cache_load(cache_file)
+    cached_dtype = (cached or {}).get("dtype", "")
     if not dtype:
-        dtype, conf, method = classify_text(text, progress=progress)
+        if cached_dtype:                          # 命中/续跑：跳过分类调用
+            dtype = cached_dtype
+            conf = cached.get("dtype_conf", "")
+            method = cached.get("dtype_method", "cache")
+        else:
+            dtype, conf, method = classify_text(text, progress=progress)
         print(f"[type] {TYPE_LABELS.get(dtype, dtype)} "
               f"(置信度 {conf} · {method})")
     else:
         dtype = dtype if dtype in TYPE_LABELS else "general"
         conf, method = 1.0, "manual"
-    core = pipeline_core(text, title, model, progress, dtype=dtype)
+        if cached and cached_dtype and cached_dtype != dtype:
+            cached = None                         # 手动类型与缓存不符 → 弃缓存
+    meta = {"model": model, "dtype": dtype,
+            "dtype_conf": str(conf), "dtype_method": method}
+
+    stripped = re.sub(r"[ \t]+", " ", text).strip()
+    story_sum = ""
+    if cached and cached.get("cards") and cached.get("intervals"):
+        print(f"[cache] 命中：{len(cached['cards'])} 块卡片 / "
+              f"{len(cached['intervals'])} 段小结，跳过逐块深读")
+        core = {"title": title, "nchar": len(stripped),
+                "chunks": split_chunks(stripped),
+                "cards": cached["cards"], "intervals": cached["intervals"],
+                "model": model}
+        story_sum = cached.get("story_summary") or ""
+    else:
+        core = pipeline_core(text, title, model, progress, dtype=dtype,
+                             cache_file=cache_file,
+                             base_meta={"cards": (cached or {}).get("cards")
+                                        or [],
+                                        "intervals": (cached or {})
+                                        .get("intervals") or [], **meta})
     core["text"] = text
     core["dtype"], core["dtype_conf"], core["dtype_method"] = dtype, conf, method
     core["is_narrative"] = (dtype == "novel")
     core["characters"] = aggregate_characters(core["cards"]) \
         if core["is_narrative"] else []
     if story and mode in ("deep", "map", "book") and core["is_narrative"]:
-        try:
-            core["story_summary"] = compose_story_summary(
-                core, model, STORY_MIN_CHARS, progress)
-        except Exception as e:            # 梗概失败不应拖垮整篇报告
-            core["story_summary"] = ""
-            core["story_error"] = str(e)[:200]
+        if story_sum:
+            core["story_summary"] = story_sum
+            print("[cache] 故事梗概命中缓存")
+        else:
+            try:
+                core["story_summary"] = compose_story_summary(
+                    core, model, STORY_MIN_CHARS, progress)
+                if cache_file and core.get("story_summary"):
+                    d = _core_cache_load(cache_file) or {"cards": [], "intervals": []}
+                    d.update(meta)
+                    d["v"] = 1
+                    d.setdefault("cards", core["cards"])
+                    d.setdefault("intervals", core["intervals"])
+                    d["story_summary"] = core["story_summary"]
+                    _core_cache_save(cache_file, d)
+            except Exception as e:            # 梗概失败不应拖垮整篇报告
+                core["story_summary"] = ""
+                core["story_error"] = str(e)[:200]
     core["quote_check"] = check_quotes(text, core["cards"])
     core["harvested"] = harvest_quotes(text, 15)
     return core
@@ -1791,6 +1908,10 @@ def deepread_text(text: str, title: str = "未命名", mode: str = "deep",
                              story_min=STORY_MIN_CHARS, dtype=dtype)
     if mode == "distill":
         return deepread_distill(text, title, model, progress, dtype=dtype)
+    if mode == "notes":
+        return deepread_notes(text, title, model, progress, dtype=dtype)
+    if mode == "persona":
+        return deepread_persona(text, title, model, progress, dtype=dtype)
     if mode not in MODES:
         raise ValueError(f"mode 必须是 {ALL_MODES}")
     core = _prepare_core(text, title, model, mode, progress, story, dtype=dtype)
@@ -1865,6 +1986,9 @@ def deepread_compare(text: str, title: str, model: str = MODEL,
 # ---------------------------------------------------------------- 萃猫蒸馏模式
 # 对标 cuimao-translator /《城市生存自救指南》蒸馏成果：
 # 骨架(主旨/结构/主张/概念/边界) → 按场景聚类拆技能 → 逐技能 SKILL.md 技能包
+# 2026-10-24 嫁接 cangjie-skill：技能包模板升级为 RIA 六段卡
+#（R 触发场景 / I 操作步骤 / A 案例 / E 验收标准 / B 常见错误 / 来源引文），
+# 并在落盘时同步生成 darwin 兼容评测用例 darwin_eval.json（见 deepread_distill 3a2）。
 
 DISTILL_SKELETON_PROMPT = """以下是《{title}》的分段小结与关键数据清单。请蒸馏出全书骨架（Markdown，六节）：
 
@@ -1920,6 +2044,7 @@ DISTILL_CANDIDATE_PROMPT = """你在为《{title}》的技能蒸馏做素材萃�
 {chunk}"""
 
 DISTILL_SKILL_PROMPT = """你在为《{title}》编写技能包中的技能《{stitle}》（管辖范围：{scope}）。
+技能卡采用 RIA 六段结构（R 触发场景 / I 操作步骤 / A 案例 / E 验收标准 / B 常见错误 / 来源引文）。
 素材含两部分：分段小结、候选素材（原则/步骤/术语/禁忌，quote 为原文逐字摘录，src 为原文块号）。
 输出 SKILL.md 文件内容（Markdown，以 YAML frontmatter 开头）：
 
@@ -1930,19 +2055,26 @@ description: （什么时候调用这个技能 + 什么时候不要用它，50-1
 
 # {stitle}
 
-## 什么时候用它
-（5-8 条用户会说的话，每条一行短引号句，对应这个技能的真实触发场景）
+## R 触发场景
+（5-8 条用户会说的话，每条一行短引号句，对应这个技能的真实触发场景——这是 R 段：回答"什么情况下加载本技能"）
 
 ## 核心判断
 （2-4 段：这个场景下书里给的底层判据——不是步骤，是"用哪把尺子量"；候选素材里的数值判据必须带上）
 
-## 怎么做
+## I 操作步骤
 （按步骤组织：每步一个 ### 小标题，用表格或清单给出判断标准/具体动作值，每步列**禁忌**。所有标准与数值必须来自素材，素材没有的具体数值不要编）
 
-## 判断标准
-（两行清单：
+## A 案例
+（1-2 个：素材里书中的真实实例，标〔原文第n块〕；素材没有实例时写一条"按上述步骤的合成演练示例"并**明确标注〔合成演练〕**，不得冒充书中案例）
+
+## E 验收标准
+（做完了怎么算成功，必须可检验。两行清单：
 **做对了会看到**：……
-**做错了会看到**：……）
+**做错了会看到**：……
+再来一行 **验收句**：一个可对照检查的具体判据，如"三个月后储蓄率提升X%"——素材没有数值就不硬造，写定性判据）
+
+## B 常见错误
+（2-4 条：新手最容易踩的坑/素材里书里警告的禁忌与反例；与"什么时候不该用它"区分开——这里写"做了会错"，那边写"根本不该做"）
 
 ## 什么时候不该用它
 （2-3 条：超出本书边界的场景、与兄弟技能的分工；素材里有时代/地域局限必须写）
@@ -1952,6 +2084,412 @@ description: （什么时候调用这个技能 + 什么时候不要用它，50-1
 
 素材：
 {materials}"""
+
+
+# darwin 兼容评测用例生成（2026-10-24 嫁接 darwin-skill）：
+# 蒸出的每个技能配 input/expected 用例，落盘 darwin_eval.json，
+# 可直接交给 darwin-skill 做「评估→改进→盲测→保留/回滚」自动进化。
+DISTILL_EVAL_PROMPT = """你在为《{title}》蒸出的技能包生成 darwin 兼容评测用例。技能清单：
+{skills}
+
+为每个技能出 2 个评测用例。只输出 JSON 数组，不要输出其他内容：
+[{{"capability": "技能slug",
+   "cases": [
+     {{"input": "一条真实用户请求（模拟 R 触发场景里的原话）",
+       "expected": "合格回答必须覆盖的要点（含书中判据/数值，可检验）"}},
+     {{"input": "一条边界/误用请求（该技能不该接或容易做错的情形）",
+       "expected": "正确行为：拒答并指出该用哪个技能，或按 B 常见错误规避"}}
+   ]}}]
+
+要求：input 要像真实用户说的话；expected 必须可对照检验（有书中判据/数值优先）。"""
+
+
+def _distill_eval_json(title: str, skills_md: list, eval_cases: list) -> dict:
+    """组装 darwin 兼容评测文件内容。"""
+    return {"capability_id": "distill-" + re.sub(r"[^\w\-]+", "-", title)[:32].strip("-").lower(),
+            "type": "skillpack-eval",
+            "source": title,
+            "origin": "DeepRead distill × cangjie RIA × darwin eval",
+            "generated_at": time.strftime("%Y-%m-%d %H:%M"),
+            "n_cases": sum(len(c.get("cases") or []) for c in eval_cases),
+            "cases": eval_cases}
+
+
+# ---------------------------------------------------------------- darwin 评测闭环
+# 2026-10-24 补全 darwin-skill 嫁接的另一半：此前只生成评测用例不消费（只写不跑）。
+# 闭环 = 装上技能作答 → rubric 打分 → 低分能力带失败原因重生成一代 → 复评。
+# distill（技能包）与 persona（人物卡）共用本评测器；本机 14b 自评存在
+# "既当运动员又当裁判"的乐观偏差，正式进化仍应交给 darwin-skill 盲测。
+DARWIN_ANSWER_SYSTEM = (
+    "你是被评测的 AI 助手，已加载一份技能/能力文档。严格按文档内容回答用户请求："
+    "文档覆盖的给出可照做的具体回答；文档没覆盖的如实说明并指出这一点，不要编造。")
+
+DARWIN_SCORE_PROMPT = """你是严格的评测员，按 rubric 给下面的回答打分（1-5 整数）：
+5=完全覆盖参考要点且可执行；4=覆盖大部分要点；3=覆盖一半或有明显遗漏；
+2=少量沾边、多为泛泛而谈；1=答非所问或编造。
+参考要点之外答得再多也不加分；要点靠编造满足的直接 ≤2。
+只输出 JSON（不要其他内容）：{{"score": 1-5, "reason": "≤60字，扣分或得分理由，须具体"}}
+
+【能力文档摘要】{skill_brief}
+
+【用户请求】
+{inp}
+
+【参考要点（合格回答必须覆盖）】
+{expected}
+
+【被评测助手的回答】
+{answer}"""
+
+DARWIN_FIX_NOTE = """
+
+【上一版评测失败反馈（本次必须针对性修正）】
+平均得分 {avg:.1f}/5，低于 3 分。失败细节：
+{fails}
+修正要求：逐条对照失败原因改写；E 验收标准必须是可检验的具体判据（数值/可观察结果），
+不含判据的段落删掉；不要为了"显得完整"添加文档素材里没有的内容。"""
+
+DARWIN_REGEN_MAX = 3          # 最多重生成 3 个低分能力（控算力）
+DARWIN_REGEN_THRESHOLD = 3.0  # 平均分低于此值才触发重生成
+
+
+def _darwin_evaluate(skills_md, eval_cases, model, progress=None):
+    """darwin 评测：每个用例「装上能力文档作答 → rubric 打分」。
+
+    skills_md: [(stitle, name, scope, body)]；eval_cases: darwin 用例列表。
+    返回 (results, avg)。results: [{"capability","title","avg","cases":[...]}]。
+    """
+    progress = progress or (lambda *a: None)
+    by_name = {nm: (st, sc, sk) for st, nm, sc, sk in skills_md}
+    caps = [c for c in eval_cases if isinstance(c, dict) and c.get("capability") in by_name]
+    total = sum(len(c.get("cases") or []) for c in caps)
+    results, done = [], 0
+    for c in caps:
+        st, sc, sk = by_name[c["capability"]]
+        cap = {"capability": c["capability"], "title": st, "cases": []}
+        for case in (c.get("cases") or []):
+            done += 1
+            progress("darwineval", done, max(total, 1))
+            inp = str(case.get("input") or "")[:800]
+            expected = str(case.get("expected") or "")[:800]
+            try:
+                ans = chat(f"【能力文档】\n{sk[:6000]}\n\n【用户请求】\n{inp}",
+                           system=DARWIN_ANSWER_SYSTEM,
+                           model=model, num_ctx=12288)
+            except Exception as e:                               # noqa: BLE001
+                cap["cases"].append({"input": inp, "score": 0,
+                                     "reason": f"作答失败: {e}"})
+                continue
+            try:
+                s = extract_json(chat(
+                    DARWIN_SCORE_PROMPT.format(
+                        skill_brief=f"{st}｜管辖：{sc}"[:200],
+                        inp=inp[:600], expected=expected, answer=ans[:4000]),
+                    model=model, num_ctx=8192, temperature=0.1))
+                score = int(s.get("score") or 0) if isinstance(s, dict) else 0
+                reason = str(s.get("reason") or "")[:140] if isinstance(s, dict) else "评分解析失败"
+            except Exception as e:                               # noqa: BLE001
+                score, reason = 0, f"评分失败: {e}"
+            cap["cases"].append({"input": inp, "answer": ans[:2000],
+                                 "score": min(5, max(0, score)), "reason": reason})
+        ss = [x["score"] for x in cap["cases"]]
+        cap["avg"] = round(sum(ss) / len(ss), 2) if ss else 0.0
+        results.append(cap)
+    allsc = [x["score"] for r in results for x in r["cases"]]
+    return results, (round(sum(allsc) / len(allsc), 2) if allsc else 0.0)
+
+
+def _darwin_result_json(title: str, kind: str, results: list, avg: float,
+                        fixed: list) -> dict:
+    """darwin 闭环评测结果文件内容（darwin-skill 可继续接力）。"""
+    return {"capability_id": f"{kind}-{re.sub(r'[^\w\-]+', '-', title)[:32].strip('-').lower()}",
+            "type": "skillpack-eval-result",
+            "source": title, "origin": "DeepRead darwin 闭环（本机自评）",
+            "generated_at": time.strftime("%Y-%m-%d %H:%M"),
+            "overall_avg": avg,
+            "regenerated": fixed,
+            "capabilities": results}
+
+
+def _darwin_render(results: list, avg: float, fixed: list) -> str:
+    """评测结果 → 报告 Markdown 段落。"""
+    if not results:
+        return ""
+    rows = "\n".join(
+        f"| {r['capability']} | {r['title'][:20]} | {r['avg']} | "
+        + "；".join(f"{x['score']}分({x['reason'][:40]})" for x in r["cases"][:2])
+        + ("…" if len(r["cases"]) > 2 else "") + "|"
+        for r in results)
+    note = (f"\n\n🔁 **低分重生成**：{len(fixed)} 个能力低于 {DARWIN_REGEN_THRESHOLD} 分，"
+            "已带失败反馈重写并复评（结果为复评分）。" if fixed else "")
+    flag = "🟢" if avg >= 4 else ("🟡" if avg >= 3 else "🔴")
+    return (f"\n\n---\n\n## {flag} darwin 评测闭环（装卡作答 → rubric 打分）\n\n"
+            f"**总体均分 {avg}/5**{note}\n\n"
+            f"| 能力 | 名称 | 均分 | 用例得分与理由 |\n| --- | --- | --- | --- |\n{rows}\n\n"
+            "> ⚠️ 本机 14b 自评存在「既当运动员又当裁判」的乐观偏差；"
+            "把 `darwin_eval_result.json` 交给 darwin-skill 做盲测/交叉评测可得更可信结论。\n")
+
+
+# ================================================================ notes 导出模式
+# 书 → 纪传卡片(Obsidian [[链接]]) + mermaid 时间线
+# 复用 pipeline_core 的 cards（entities / relations 三元组）+ 文体自适应抽取。
+# 这是 DeepRead 在 history/novel 文体上已抽出的「实体 + 关系 + 时间信息」的
+# 下游落盘形态，不另起抽取管线，仅做一次 LLM 结构化聚合 + 文件渲染。
+
+NOTES_SYSTEM = (
+    "你是严谨的中文史料/人物结构化助手。只依据给定文本片段与逐段抽取的卡片提取信息，"
+    "文本中没有的不要编造；人物身份、关系、时间、事件都必须能在原文卡片里找到依据。"
+)
+
+NOTES_PROMPT = """基于《{title}》的下列「逐段抽取卡片」素材，产出结构化「纪传 + 时间线」数据，输出 JSON（不要输出其他内容）：
+
+{{
+  "entities": [
+    {{
+      "name": "人物 / 势力 / 机构 / 地点名（用书中原称）",
+      "type": "人物 | 势力 | 机构 | 地点 | 概念",
+      "desc": "一句话身份/性质（≤40字，仅用原文依据）",
+      "faction": "所属势力/阵营（无则空串）",
+      "relations": ["与其他实体的关系三元组，如『甲 是 乙的盟友』『甲 击败 乙』"],
+      "events": ["该实体参与的关键事件名（与下方 timeline 的 event 对应）"]
+    }}
+  ],
+  "timeline": [
+    {{"time": "年份/朝代/约X年（不明用『约』）", "event": "事件名",
+      "actors": ["相关实体名"], "note": "一句话意义（≤30字）"}}
+  ]
+}}
+
+要求：
+- entities 收录全部重要人物与势力/机构（出现 ≥2 次或关键单次），去重，名称与原文一致；
+- relations 必须是「甲 关系 乙」式三元组，且甲或乙是本列表中的实体；
+- timeline 按时间先后排序，time 尽量可比较；事件必须与 entities 的 events 对应；
+- 不要编造原文没有的关系或时间。
+
+素材（逐段卡片聚合，含实体与关系三元组）：
+{cards}
+"""
+
+
+def _notes_cards_text(cards: list, limit_total: int = 14000) -> str:
+    """把 cards 压成带 entities/relations 的紧凑文本，供 notes 聚合 LLM 使用。"""
+    out = []
+    for i, c in enumerate(cards, 1):
+        if not isinstance(c, dict):
+            continue
+        lines = [f"[块{i}]"]
+        for p in (c.get("points") or [])[:6]:
+            v = p.get("point") if isinstance(p, dict) else str(p)
+            if v:
+                lines.append("· " + str(v)[:100])
+        for e in (c.get("entities") or [])[:12]:
+            lines.append("· 实体：" + str(e)[:20])
+        for r in (c.get("relations") or [])[:8]:
+            lines.append("· 关系：" + str(r)[:80])
+        t = "\n".join(lines)
+        if t:
+            out.append(t[:1000])
+    return "\n\n".join(out)[:limit_total]
+
+
+def _safe_name(s: str) -> str:
+    """实体名 → 安全文件名/链接 id（保持中文，仅剔除非法字符并限长）。"""
+    s = re.sub(r'[\\/:*?"<>|\n\r\t]+', "_", str(s)).strip()
+    return (s[:40] or "实体").strip()
+
+
+def _wiki(text: str, names: list, safe_map: dict) -> str:
+    """把文本里出现的已知实体名替换为 Obsidian 双向链接 [[safe_name]]。"""
+    # 长名优先，避免短名被先替换后造成嵌套；用负向环视避免已在 [[ ]] 内的重复替换
+    for nm in sorted(set(names), key=len, reverse=True):
+        if not nm:
+            continue
+        link = "[[" + safe_map.get(nm, _safe_name(nm)) + "]]"
+        text = re.sub(r"(?<!\[\[)" + re.escape(nm) + r"(?!\]\])",
+                      lambda m, _l=link: _l, text)
+    return text
+
+
+def compose_notes(core: dict, model: str = MODEL, progress=None) -> dict:
+    """基于公共中间产物，产出纪传卡片 + 时间线的结构化数据（一次 LLM 聚合）。"""
+    progress = progress or (lambda *a: None)
+    cards_txt = _notes_cards_text(core.get("cards") or [])
+    progress("notes", 0, 3)
+    raw = chat(NOTES_PROMPT.format(title=core["title"], cards=cards_txt),
+               system=NOTES_SYSTEM, json_mode=True, model=model, num_ctx=12288)
+    try:
+        data = extract_json(raw)
+    except ValueError:
+        data = {"entities": [], "timeline": []}
+    if not isinstance(data, dict):
+        data = {"entities": [], "timeline": []}
+    ents = [e for e in (data.get("entities") or [])
+            if isinstance(e, dict) and e.get("name")]
+    tl = [t for t in (data.get("timeline") or [])
+          if isinstance(t, dict) and t.get("event")]
+    progress("notes", 1, 3)
+    return {"entities": ents, "timeline": tl, "title": core["title"]}
+
+
+def _render_timeline(tl: list, title: str, names: set) -> str:
+    lines = ["# 《" + title + "》· 时间线", "",
+             "> DeepRead notes 导出 · 按时间排序（不明处用『约』）", "",
+             "```mermaid", "timeline", "    title 《" + title + "》时间线"]
+    for t in tl:
+        time_s = (str(t.get("time") or "未知")).strip() or "未知"
+        ev = (str(t.get("event") or "")).strip()
+        note = (str(t.get("note") or "")).strip()
+        seg = f"    {time_s} : {ev}" + (f" : {note}" if note else "")
+        lines.append(seg)
+    lines += ["```", "",
+              "## 时间线明细（表格，便于不渲染 mermaid 的环境）", "",
+              "| 时间 | 事件 | 相关实体 | 意义 |", "|---|---|---|---|"]
+    for t in tl:
+        time_s = (str(t.get("time") or "未知")).strip() or "未知"
+        ev = (str(t.get("event") or "")).strip()
+        actors = t.get("actors") or []
+        actors_disp = " ".join(f"[[{a}]]" for a in actors if a in names) or "—"
+        note = (str(t.get("note") or "")).strip()
+        lines.append(f"| {time_s} | {ev} | {actors_disp} | {note} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_index(ents: list, tl: list, title: str) -> str:
+    by_type: dict = {}
+    for e in ents:
+        ty = (str(e.get("type") or "其他")).strip() or "其他"
+        by_type.setdefault(ty, []).append(e)
+    type_label = {"人物": "人物", "势力": "势力/阵营", "机构": "机构/组织",
+                  "地点": "地点", "概念": "概念"}
+    lines = ["# 《" + title + "》· 纪传 + 时间线索引", "",
+             f"> DeepRead notes 导出 · {len(ents)} 个实体 · {len(tl)} 条时间线事件", "",
+             "本目录结构：",
+             "- `索引.md`（本文件）：实体总览，点击 `[[名称]]` 跳转卡片",
+             "- `cards/`：每个实体的纪传卡片（Obsidian 双向链接）",
+             "- `时间线.md`：mermaid 时间线 + 明细表", ""]
+    for ty in ["人物", "势力", "机构", "地点", "概念", "其他"]:
+        lst = by_type.get(ty)
+        if not lst:
+            continue
+        lines.append(f"## {type_label.get(ty, ty)}（{len(lst)}）")
+        for e in lst:
+            nm = e["name"]
+            desc = (str(e.get("desc") or "")).strip()
+            lines.append(f"- [[{nm}]] — {desc}")
+        lines.append("")
+    lines.append("## 时间线")
+    lines.append("见 [[时间线]]")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_notes(data: dict, out_dir: str, cards_dir: str) -> dict:
+    """把结构化数据渲染为：每个实体的纪传卡片 + 时间线.md + 索引.md。"""
+    title = data["title"]
+    ents = data["entities"]
+    tl = data["timeline"]
+    names = [e["name"] for e in ents]
+    name_set = set(names)
+    safe_map = {nm: _safe_name(nm) for nm in names}
+    # 文件名去重（同名实体共享卡片）
+    used, fname_map = set(), {}
+    for nm in names:
+        s = safe_map[nm]
+        if s in used:
+            k = 2
+            while f"{s}_{k}" in used:
+                k += 1
+            s = f"{s}_{k}"
+        used.add(s)
+        fname_map[nm] = s
+
+    files = []
+    # 1) 纪传卡片
+    for e in ents:
+        nm = e["name"]
+        etype = (str(e.get("type") or "人物")).strip() or "人物"
+        desc = (str(e.get("desc") or "")).strip()
+        faction = (str(e.get("faction") or "")).strip()
+        rels = e.get("relations") or []
+        evs = e.get("events") or []
+        linked_others = set()
+        rel_lines = []
+        for r in rels:
+            rs = str(r)
+            rel_lines.append("- " + _wiki(rs, names, safe_map))
+            for o in names:
+                if o != nm and o in rs:
+                    linked_others.add(o)
+        faction_disp = ""
+        if faction:
+            if faction in name_set and faction != nm:
+                linked_others.add(faction)
+                faction_disp = f"[[{faction}]]"
+            else:
+                faction_disp = faction
+
+        md = (f"---\ntype: {etype}\n书名: 《{title}》\n来源: DeepRead notes 导出\n---\n"
+              f"# {nm}\n\n> {desc}\n")
+        if faction_disp:
+            md += f"\n**所属势力**：{faction_disp}\n"
+        if rel_lines:
+            md += "\n## 关系\n" + "\n".join(rel_lines) + "\n"
+        if evs:
+            md += "\n## 涉及事件\n" + "\n".join(f"- {str(ev)}" for ev in evs) + "\n"
+        if linked_others:
+            md += ("\n## 关系网\n"
+                   + " ".join(f"[[{o}]]" for o in sorted(linked_others)) + "\n")
+        md += (f"\n---\n*由 DeepRead notes 模式从《{title}》自动提取；"
+               "链接指向同书其他实体卡片。*\n")
+        fn = os.path.join(cards_dir, fname_map[nm] + ".md")
+        open(fn, "w", encoding="utf-8").write(md)
+        files.append(fn)
+
+    # 2) 时间线.md
+    tl_md = _render_timeline(tl, title, name_set)
+    tl_path = os.path.join(out_dir, "时间线.md")
+    open(tl_path, "w", encoding="utf-8").write(tl_md)
+    files.append(tl_path)
+
+    # 3) 索引.md
+    idx = _render_index(ents, tl, title)
+    idx_path = os.path.join(out_dir, "索引.md")
+    open(idx_path, "w", encoding="utf-8").write(idx)
+    files.append(idx_path)
+
+    return {"files": files, "index_md": idx,
+            "cards_dir": cards_dir, "timeline_path": tl_path}
+
+
+def deepread_notes(text: str, title: str = "未命名", model: str = MODEL,
+                   progress=None, dtype: str = "") -> "tuple[str, dict]":
+    """notes 导出模式：书 → 纪传卡片([[链接]]) + mermaid 时间线。
+
+    复用 pipeline_core（一次公共深读；cards 已含 entities/relations）。
+    返回 (索引md, structured)；产物落盘 reports/notes_<ts>_<title>/。"""
+    progress = progress or (lambda *a: None)
+    core = _prepare_core(text, title, model, "notes", progress,
+                         story=False, dtype=dtype)
+    data = compose_notes(core, model, progress)
+    progress("notes", 2, 3)
+    out_dir = os.path.join(
+        ROOT, "reports",
+        "notes_" + time.strftime("%Y%m%d_%H%M%S") + "_" + _safe_name(title)[:20])
+    os.makedirs(out_dir, exist_ok=True)
+    cards_dir = os.path.join(out_dir, "cards")
+    os.makedirs(cards_dir, exist_ok=True)
+    rendered = _render_notes(data, out_dir, cards_dir)
+    progress("notes", 3, 3)
+    md = rendered["index_md"]
+    structured = {
+        "title": title, "mode": "notes", "model": model,
+        "nchar": core["nchar"], "nchunks": len(core["chunks"]),
+        "dtype": core.get("dtype", "general"),
+        "entities": len(data["entities"]), "timeline": len(data["timeline"]),
+        "out_dir": out_dir, "files": rendered["files"], "report": md,
+    }
+    return md, structured
 
 
 def _seg_materials(core: dict, seg_ids: list, budget: int = 8000) -> str:
@@ -2135,7 +2673,7 @@ def deepread_distill(text: str, title: str = "未命名", model: str = MODEL,
                      encoding="utf-8").write(ctext)
     except OSError as e:
         print(f"[distill] 骨架/候选落盘失败: {e}")
-    skills_md, skill_files = [], []
+    skills_md, skill_files, mats_by_name = [], [], {}
     for k, s in enumerate(plan):
         progress("skill", k + 1, len(plan))
         name = re.sub(r"[^a-z0-9\-]+", "",
@@ -2159,6 +2697,7 @@ def deepread_distill(text: str, title: str = "未命名", model: str = MODEL,
         except Exception as e:
             sk = f"（技能生成失败：{e}）"
         skills_md.append((stitle, name, scope, sk))
+        mats_by_name[name] = mats
         try:                                    # 落盘技能包（可导入 SKILL.md 的助手）
             d = os.path.join(base, "技能包", name)
             os.makedirs(d, exist_ok=True)
@@ -2170,6 +2709,93 @@ def deepread_distill(text: str, title: str = "未命名", model: str = MODEL,
             print(f"[distill] 技能落盘失败: {e}")
     if not skills_md:
         raise ValueError("技能聚类失败（无有效技能）")
+
+    # 3a2) darwin 兼容评测用例（一次 LLM 调用；失败退化为确定性用例，不阻断）
+    eval_cases = []
+    try:
+        progress("eval", 1, 2)
+        skills_brief = "\n".join(f"- {nm}｜{st}｜管辖：{sc}"
+                                 for st, nm, sc, _s in skills_md)
+        ev = extract_json(chat(DISTILL_EVAL_PROMPT.format(
+            title=title, skills=skills_brief),
+            model=model, num_ctx=8192, temperature=0.2))
+        if isinstance(ev, list):
+            eval_cases = [c for c in ev if isinstance(c, dict) and c.get("capability")]
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[distill] 评测用例生成失败，退化为确定性用例: {e}")
+    if not eval_cases:                    # 确定性兜底：每技能 1 条主用例
+        eval_cases = [{"capability": nm,
+                       "cases": [{"input": f"我想处理：{sc}",
+                                  "expected": "按技能步骤给出可执行方案，"
+                                              "符合 SKILL.md 的 E 验收标准"}]}
+                      for st, nm, sc, _s in skills_md]
+    try:
+        with open(os.path.join(base, "darwin_eval.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(_distill_eval_json(title, skills_md, eval_cases), f,
+                      ensure_ascii=False, indent=2)
+        print(f"[distill] darwin_eval.json 已落盘"
+              f"（{sum(len(c.get('cases') or []) for c in eval_cases)} 用例）")
+    except OSError as e:
+        print(f"[distill] darwin_eval.json 落盘失败: {e}")
+
+    # 3a3) darwin 评测闭环：装卡作答 → rubric 打分 → 低分能力重生成一代 → 复评
+    eval_results, eval_avg, fixed = [], 0.0, []
+    try:
+        eval_results, eval_avg = _darwin_evaluate(skills_md, eval_cases, model, progress)
+        low = [r for r in eval_results if r["avg"] < DARWIN_REGEN_THRESHOLD][:DARWIN_REGEN_MAX]
+        if low:
+            for k, r in enumerate(low, 1):
+                progress("regen", k, len(low))
+                idx = next((i for i, (_st, nm, _sc, _sk) in enumerate(skills_md)
+                            if nm == r["capability"]), None)
+                if idx is None:
+                    continue
+                st, nm, sc, _old = skills_md[idx]
+                fails = "\n".join(f"- 输入「{x['input'][:80]}」得 {x['score']} 分：{x['reason']}"
+                                  for x in r["cases"])
+                mats = (mats_by_name.get(nm) or _seg_materials(core, [1, min(2, n)]))
+                try:
+                    fixed_sk = chat(DISTILL_SKILL_PROMPT.format(
+                        title=title, stitle=st, scope=sc, name=nm,
+                        materials=mats[:12000] + DARWIN_FIX_NOTE.format(
+                            avg=r["avg"], fails=fails[:1200])),
+                        model=model, num_ctx=12288)
+                    fixed_sk = re.sub(r"^```[a-z]*\s*|\s*```\s*$", "", fixed_sk.strip(),
+                                      flags=re.I | re.M).strip()
+                except Exception as e:                           # noqa: BLE001
+                    print(f"[darwin] {nm} 重生成失败: {e}")
+                    continue
+                skills_md[idx] = (st, nm, sc, fixed_sk)
+                try:
+                    d = os.path.join(base, "技能包", nm)
+                    body = fixed_sk if fixed_sk.startswith("---") else \
+                        f"---\nname: {nm}\ndescription: {sc}\n---\n\n" + fixed_sk
+                    open(os.path.join(d, "SKILL.md"), "w", encoding="utf-8").write(body)
+                except OSError as e:
+                    print(f"[darwin] {nm} 重写落盘失败: {e}")
+            re_caps = [c for c in eval_cases if c.get("capability") in
+                       {r["capability"] for r in low}]
+            re_results, _ra = _darwin_evaluate(skills_md, re_caps, model, progress)
+            by_cap = {r["capability"]: r for r in re_results}
+            for i, r in enumerate(eval_results):
+                if r["capability"] in by_cap:
+                    eval_results[i] = by_cap[r["capability"]]
+                    fixed.append(r["capability"])
+            allsc = [x["score"] for r in eval_results for x in r["cases"]]
+            eval_avg = round(sum(allsc) / len(allsc), 2) if allsc else eval_avg
+    except Exception as e:                                       # noqa: BLE001
+        print(f"[darwin] 评测闭环失败（不影响主产物）: {e}")
+    if eval_results:
+        try:
+            with open(os.path.join(base, "darwin_eval_result.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(_darwin_result_json(title, "distill", eval_results,
+                                              eval_avg, fixed), f,
+                          ensure_ascii=False, indent=2)
+            print(f"[distill] darwin_eval_result.json 已落盘（均分 {eval_avg}/5）")
+        except OSError as e:
+            print(f"[darwin] 评测结果落盘失败: {e}")
 
     # 3b) 怎么用.md（导入指南，对标萃猫）
     try:
@@ -2215,7 +2841,11 @@ def deepread_distill(text: str, title: str = "未命名", model: str = MODEL,
            "2. 建议一次只开当前用得上的技能，装多个不等于开多个；\n"
            "3. 判断技能用途先看 frontmatter 的 description"
            "（写了什么时候用、什么时候不用）；\n"
-           "4. 报告内「全书骨架」是所有技能共享的判据来源，技能之间有冲突时以骨架为准。\n")
+            "4. 报告内「全书骨架」是所有技能共享的判据来源，技能之间有冲突时以骨架为准；\n"
+           "5. `darwin_eval.json` 是评测用例、`darwin_eval_result.json` 是本机闭环评测结果"
+           "（darwin-skill 兼容格式）——把两者一起交给 darwin-skill 即可自动进化"
+           "（评估→改进→盲测→保留/回滚）。\n")
+    md += _darwin_render(eval_results, eval_avg, fixed)
     structured = {"title": title, "mode": "distill", "model": model,
                   "nchar": core["nchar"], "nchunks": len(core["chunks"]),
                   "intervals": intervals, "cards": core["cards"],
@@ -2224,8 +2854,292 @@ def deepread_distill(text: str, title: str = "未命名", model: str = MODEL,
                   "dtype_conf": core.get("dtype_conf", ""),
                   "skills": [st for st, _n, _s, _sk in skills_md],
                   "skill_files": skill_files,
+                  "darwin_eval_n": sum(len(c.get("cases") or []) for c in eval_cases),
+                  "darwin_eval_avg": eval_avg,
+                  "darwin_regenerated": fixed,
                   "distill_dir": os.path.basename(base),
                   "cand": {k: len(v) for k, v in cand.items()},
+                  "report": md}
+    return md, structured
+
+
+# ---------------------------------------------------------------- persona 人物精读模式
+# 2026-10-24 嫁接 nuwa-skill 思想：蒸馏人而非书。
+# 访谈/传记/自述/演讲稿 → 「认知操作系统卡」：思维框架/决策模式/表达DNA/
+# 反共识观点/盲点争议 + 逐字金句（回原文校验），并落盘可导入的人物 SKILL.md。
+# 与 distill 互补：distill 蒸"书本方法"，persona 蒸"人物思维"。
+
+PERSONA_SYSTEM = (
+    "你是严谨的人物认知蒸馏助手（nuwa 思想：蒸馏思维方式，不是写吹捧小传）。"
+    "只依据给定素材提炼，每个字段都要有原文依据；素材不足的字段如实留空数组，"
+    "严禁编造人物没说过的话、没表达过的观点。"
+)
+
+PERSONA_PROMPT = """基于《{title}》的下列素材，把说话人/主人公蒸馏成一张「认知操作系统卡」。只输出 JSON（不要其他内容）：
+
+{{
+  "identity": "一句话身份+底色（≤40字）",
+  "mental_models": [
+    {{"name": "思维模型名（他看世界用的一把尺子）",
+      "core": "内核一句话",
+      "trigger": "什么问题/场景出现时该启用这把尺子（写成用户会遇到的情境，具体）",
+      "steps": ["按这个模型分析问题的操作步骤，2-4步，每步可照做"],
+      "pass_criteria": "用对了会看到什么（可检验的标志：产出物/判断形式/结论形状）",
+      "misuse": "最容易用错的方式（素材撑不起来就空串）",
+      "evidence": "原文依据（概述或短摘录，须能在素材中找到）"}}],
+  "decisions": [
+    {{"situation": "他面临X时", "tendency": "倾向做Y（具体动作）", "basis": "原文依据"}}],
+  "dna": {{"sentence": "句式特征", "catchphrase": "口头禅/高频词",
+           "argument": "论证风格（数据驱动/类比/讲故事/先破后立…）",
+           "avoid": "他从不说/回避的表达"}},
+  "contrarian": [
+    {{"view": "反共识观点", "reason": "他的理由", "evidence": "原文依据"}}],
+  "blindspots": ["盲点/争议/适用局限（2-4条，基于素材能指出什么就写什么）"],
+  "quotes": ["金句（必须逐字摘自素材）"]
+}
+
+数量要求：mental_models 3-5 个；decisions 3-6 条；contrarian 0-4 条（素材撑不起来就空）；quotes 3-8 条。
+硬性要求：evidence/quotes 必须能在素材中找到依据；quotes 一字不改。
+RIA 要求：trigger/steps/pass_criteria 必须从素材中他实际的做法里归纳，不是通用方法论套话；
+素材撑不出操作步骤的模型，steps 如实留空数组，不要编通用步骤凑数。
+
+素材（分段小结与原文摘录）：
+{materials}"""
+
+# nuwa 三重验证（2026-10-24 补全女娲嫁接的另一半——此前只借了"认知卡"概念，
+# 没接它真正的差异化能力：跨域复现 / 问题生成力 / 认知排他性）。
+PERSONA_VALIDATE_PROMPT = """你是苛刻的认知蒸馏验证员，对下面这张「认知操作系统卡」执行 nuwa 三重验证，只输出 JSON（不要其他内容）：
+
+{
+ "cross_domain": {"score": 1-5, "note": "跨域复现力：把卡里的思维框架迁移到它原本领域之外（例如把投资框架用在带团队/做产品上），还能自洽运转吗？note 必须指出哪几条能迁移、哪几条会断裂，并各举一例"},
+ "question_power": {"score": 1-5, "note": "问题生成力：用这张卡能提出多少有锋利度的新问题？note 里给出 2 个最好的问题原句"},
+ "exclusivity": {"score": 1-5, "note": "认知排他性：把人物名字遮掉，这套思维还有辨识度吗？还是通篇是任何成功学都有的正确废话？note 必须引用卡里具体条目作证据"},
+ "verdict": "PASS / REVISE / FAIL 三选一"
+}
+
+打分纪律：4 分及以上必须举出卡里的具体条目；note 写不出具体证据就老实给低分；不写恭维话。
+
+【认知卡】
+{card}"""
+
+# 人物卡 darwin 评测用例生成（2 条正常 + 1 条边界；失败退化为确定性用例）
+PERSONA_EVAL_PROMPT = """基于下面这张人物认知卡，出 3 条 darwin 评测用例，只输出 JSON 数组（不要其他内容）：
+[{"capability": "persona", "cases": [
+   {"input": "正常请求①：要求用卡里某条思维模型分析一个具体问题（input 要像真实用户说的话）",
+     "expected": "合格回答必须调用卡中哪条/哪几条模型（引用条目名），按其触发场景与步骤展开"}},
+   {"input": "正常请求②：要求模拟此人面对某取舍的决策或按其表达风格输出",
+     "expected": "合格回答须符合卡中决策模式/表达DNA，不引入卡外倾向"}},
+   {"input": "边界请求：问一个卡中明确未涉猎或不适用的领域",
+     "expected": "正确行为：指出超出卡片依据范围并拒答或说明局限，不强行套用"}}]]
+
+expected 必须可对照检验（引用卡中具体条目名）。
+
+【认知卡】
+{card}"""
+
+
+def _persona_render(title: str, p: dict, quote_marks: dict) -> str:
+    """认知卡 JSON → Markdown 报告正文。quote_marks: 金句→是否逐字命中原文。"""
+    def _list(items, render):
+        return "\n".join(render(i) for i in items) or "（素材不足，未提炼）"
+    md = f"## 身份底色\n\n{p.get('identity') or '（未提炼）'}\n"
+    md += "\n## 思维框架（mental models · RIA 可执行化）\n\n" + _list(
+        p.get("mental_models") or [],
+        lambda m: (f"- **{m.get('name','')}**：{m.get('core','')}\n"
+                   f"  - 🔔 触发场景：{m.get('trigger') or m.get('usage','') or '（未提炼）'}\n"
+                   f"  - 🪜 操作步骤：{' → '.join(m.get('steps') or []) or '（素材不足以支撑步骤，未提炼）'}\n"
+                   f"  - ✅ 验收标准：{m.get('pass_criteria','') or '（未提炼）'}\n"
+                   f"  - ⚠️ 常见误用：{m.get('misuse','') or '（未提炼）'}\n"
+                   f"  - 原文依据：{m.get('evidence','')}")) + "\n"
+    md += "\n## 决策模式\n\n" + _list(
+        p.get("decisions") or [],
+        lambda d: f"- 面临**{d.get('situation','')}** → 倾向{d.get('tendency','')}"
+                  f"（依据：{d.get('basis','')}）") + "\n"
+    dna = p.get("dna") or {}
+    if dna:
+        md += ("\n## 表达 DNA\n\n"
+               f"- 句式：{dna.get('sentence','') or '（未提炼）'}\n"
+               f"- 口头禅/高频词：{dna.get('catchphrase','') or '（未提炼）'}\n"
+               f"- 论证风格：{dna.get('argument','') or '（未提炼）'}\n"
+               f"- 回避的表达：{dna.get('avoid','') or '（未提炼）'}\n")
+    if p.get("contrarian"):
+        md += "\n## 反共识观点\n\n" + _list(
+            p["contrarian"],
+            lambda c: f"- **{c.get('view','')}**——{c.get('reason','')}"
+                      f"（依据：{c.get('evidence','')}）") + "\n"
+    md += "\n## 盲点与争议\n\n" + _list(
+        p.get("blindspots") or [], lambda b: f"- {b}") + "\n"
+    md += "\n## 金句（逐字校验）\n\n" + _list(
+        p.get("quotes") or [],
+        lambda q: f"- 「{q}」" + quote_marks.get(q, "")) + "\n"
+    return md
+
+
+def _persona_validation_md(v: dict) -> str:
+    """nuwa 三重验证结果 → 报告 Markdown 段落。"""
+    if not v:
+        return ""
+    def _one(key, label):
+        it = v.get(key)
+        if not isinstance(it, dict):
+            return f"- **{label}**：（未验证）"
+        return f"- **{label}**：{it.get('score', '?')}/5 —— {it.get('note', '')}"
+    icon = {"PASS": "🟢", "REVISE": "🟡", "FAIL": "🔴"}.get(
+        str(v.get("verdict", "")).strip().upper()[:6], "⚪")
+    return (f"\n## {icon} nuwa 三重验证（{v.get('verdict', '')}）\n\n"
+            + _one("cross_domain", "跨域复现力") + "\n"
+            + _one("question_power", "问题生成力") + "\n"
+            + _one("exclusivity", "认知排他性") + "\n"
+            + "\n> 验证方法嫁接自 nuwa-skill；分数是本机 14b 评判，仅供参考。\n")
+
+
+def deepread_persona(text: str, title: str = "未命名", model: str = MODEL,
+                     progress=None, dtype: str = ""):
+    """persona 人物精读：访谈/传记/自述 → 认知操作系统卡 + 人物 SKILL.md。
+    返回 (报告md, structured)。嫁接 nuwa-skill 思想，金句回原文逐字校验。"""
+    progress = progress or (lambda *a: None)
+    core = _prepare_core(text, title, model, "persona", progress,
+                         story=False, dtype=dtype)
+    n = len(core.get("intervals") or [])
+    mats = _seg_materials(core, list(range(1, n + 1)) if n else [],
+                          budget=12000)
+    if len(mats) < 500:                       # 小结太粗 → 直接喂原文块
+        mats = "\n\n".join(str(c) for c in (core.get("chunks") or []))[:12000]
+
+    progress("persona", 1, 2)
+    # prompt 含大量 JSON 花括号模板，不能用 .format()（单}会炸），改用 replace 传参
+    def _gen_card(mats_text: str, fix_note: str = ""):
+        prompt = PERSONA_PROMPT.replace("{title}", title).replace(
+            "{materials}", mats_text + fix_note)
+        return extract_json(chat(prompt, system=PERSONA_SYSTEM, json_mode=True,
+                                 model=model, num_ctx=16384, temperature=0.3))
+
+    def _quote_check(card: dict) -> dict:
+        qm = {}
+        for q in (card.get("quotes") or []):
+            qm[q] = "✅ 已逐字命中原文" \
+                if re.sub(r"\s+", "", str(q)) in norm else "⚠️ 未能在原文逐字命中"
+        return qm
+
+    j = _gen_card(mats)
+    if not isinstance(j, dict):
+        raise ValueError("人物卡 JSON 解析失败")
+
+    # 金句回原文逐字校验（复用蒸馏模式的防编造底线）
+    norm = re.sub(r"\s+", "", text)
+    quote_marks = _quote_check(j)
+    n_hit = sum(1 for v in quote_marks.values() if v.startswith("✅"))
+
+    # 3b) darwin 评测闭环：人物卡出题（2 正常 + 1 边界）→ 装卡作答 → 打分 → 低分重生成
+    pe_cases = []
+    try:
+        ev = extract_json(chat(PERSONA_EVAL_PROMPT.replace(
+            "{card}", json.dumps(j, ensure_ascii=False)),
+            model=model, num_ctx=8192, temperature=0.2))
+        if isinstance(ev, list) and ev and isinstance(ev[0], dict) and ev[0].get("cases"):
+            pe_cases = ev
+    except Exception as e:                                       # noqa: BLE001
+        print(f"[persona] 评测用例生成失败，退化为确定性用例: {e}")
+    if not pe_cases:
+        mm_names = "、".join(str(m.get("name") or "")
+                             for m in (j.get("mental_models") or [])[:3]) or "其思维框架"
+        pe_cases = [{"capability": "persona", "cases": [
+            {"input": f"请用他的思维框架（{mm_names}）分析一个我正在纠结的决定",
+             "expected": "须调用卡中至少一条思维模型并按其触发场景/步骤展开，"
+                         "结论形状符合该模型的验收标准"},
+            {"input": "模拟他在重大取舍面前的决策倾向，并说明理由",
+             "expected": "须依据卡中决策模式/反共识观点，不得编造卡中没有的倾向"},
+            {"input": "请他用这套思维预测明天的股市大盘走势",
+             "expected": "正确行为：指出该请求超出卡片依据范围（卡中无此能力依据），不强行套用"}]}]
+    p_skills = [(str(title)[:30] or "人物", "persona",
+                 str(j.get("identity") or "")[:80],
+                 json.dumps(j, ensure_ascii=False)[:6000])]
+    eval_results, eval_avg, fixed = [], 0.0, []
+    try:
+        eval_results, eval_avg = _darwin_evaluate(p_skills, pe_cases, model, progress)
+        if eval_results and eval_avg < DARWIN_REGEN_THRESHOLD:
+            progress("regen", 1, 1)
+            fails = "\n".join(f"- 输入「{x['input'][:70]}」得 {x['score']} 分：{x['reason']}"
+                              for r in eval_results for x in r["cases"])
+            j2 = _gen_card(mats, DARWIN_FIX_NOTE.format(avg=eval_avg, fails=fails[:1200]))
+            if isinstance(j2, dict) and j2.get("mental_models"):
+                j = j2
+                quote_marks = _quote_check(j)
+                n_hit = sum(1 for v in quote_marks.values() if v.startswith("✅"))
+                fixed.append("persona")
+                p_skills[0] = (p_skills[0][0], "persona",
+                               str(j.get("identity") or "")[:80],
+                               json.dumps(j, ensure_ascii=False)[:6000])
+                eval_results, eval_avg = _darwin_evaluate(
+                    p_skills, pe_cases, model, progress)
+    except Exception as e:                                       # noqa: BLE001
+        print(f"[persona] darwin 评测闭环失败（不影响主产物）: {e}")
+
+    # 3c) nuwa 三重验证（对最终卡；验证结论只如实上报，不自动改写内容）
+    validation = {}
+    try:
+        progress("nuwacheck", 1, 1)
+        vj = extract_json(chat(PERSONA_VALIDATE_PROMPT.replace(
+            "{card}", json.dumps(j, ensure_ascii=False)),
+            model=model, num_ctx=8192, temperature=0.2))
+        if isinstance(vj, dict) and vj.get("verdict"):
+            validation = vj
+    except Exception as e:                                       # noqa: BLE001
+        print(f"[persona] 三重验证失败: {e}")
+
+    body = _persona_render(title, j, quote_marks) + _persona_validation_md(validation)
+
+    # 落盘：认知卡 + 可导入的人物 SKILL.md（nuwa 产物形态）
+    base = os.path.join("reports", "persona_" + time.strftime("%Y%m%d_%H%M%S")
+                        + "_" + re.sub(r"[^\w\-]+", "_", title)[:24])
+    skill_files = []
+    try:
+        os.makedirs(base, exist_ok=True)
+        ident = str(j.get("identity") or title)[:60]
+        skill_body = (
+            f"---\nname: persona-{re.sub(r'[^a-z0-9\-]+', '', title.lower())[:32] or 'figure'}\n"
+            f"description: 蒸馏自《{title}》的人物认知卡（{ident}）。"
+            f"当你想用此人的思维框架分析问题、模拟其决策视角、或按其表达风格输出时调用；"
+            f"涉及此人没有涉猎的领域不要用它。\n---\n\n"
+            f"# 人物认知卡：{title}\n\n" + body)
+        open(os.path.join(base, "SKILL.md"), "w", encoding="utf-8").write(skill_body)
+        with open(os.path.join(base, "认知卡.json"), "w", encoding="utf-8") as f:
+            json.dump({**j, "validation": validation}, f, ensure_ascii=False, indent=2)
+        skill_files.append(os.path.basename(base) + "/SKILL.md")
+    except OSError as e:
+        print(f"[persona] 落盘失败: {e}")
+    if eval_results:
+        try:
+            with open(os.path.join(base, "darwin_eval_result.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(_darwin_result_json(title, "persona", eval_results,
+                                              eval_avg, fixed), f,
+                          ensure_ascii=False, indent=2)
+        except OSError as e:
+            print(f"[persona] 评测结果落盘失败: {e}")
+
+    md = (f"# DeepRead 人物精读 · {title}\n\n"
+          f"> 模型 {model} · 全文 {core['nchar']} 字 · 金句逐字命中 {n_hit}/"
+          f"{len(quote_marks)} · {time.strftime('%Y-%m-%d %H:%M')}\n"
+          f"> 蒸馏思想嫁接自 nuwa-skill（蒸馏人而非书）；与萃猫蒸馏（蒸书本方法）互补\n\n"
+          + body
+          + _darwin_render(eval_results, eval_avg, fixed)
+          + (f"\n\n---\n\n## 产物\n\n人物 SKILL.md 已落盘：`{skill_files[0]}`"
+             "——可直接导入支持 SKILL.md 规范的 AI 助手，让助手以该人物的"
+             "思维框架与决策模式对话。\n" if skill_files else ""))
+    structured = {"title": title, "mode": "persona", "model": model,
+                  "nchar": core["nchar"], "nchunks": len(core["chunks"]),
+                  "intervals": core["intervals"], "cards": core["cards"],
+                  "is_narrative": core.get("is_narrative", False),
+                  "dtype": core.get("dtype", "general"),
+                  "dtype_conf": core.get("dtype_conf", ""),
+                  "quote_hit": f"{n_hit}/{len(quote_marks)}",
+                  "persona": j,
+                  "nuwa_validation": validation,
+                  "darwin_eval_avg": eval_avg,
+                  "darwin_regenerated": fixed,
+                  "skill_files": skill_files,
+                  "persona_dir": os.path.basename(base),
                   "report": md}
     return md, structured
 
@@ -2419,12 +3333,22 @@ def main():
     md, st = deepread_text(text, title, args.mode, args.model, progress,
                            critique=args.critique, story=not args.no_story,
                            dtype=args.type)
-    out = args.out or os.path.join(
-        ROOT, "reports",
-        f"{time.strftime('%Y%m%d_%H%M%S')}_{title[:20]}_{args.mode}.md")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    open(out, "w", encoding="utf-8").write(md)
-    print(f"OK {out}  ({time.time()-t0:.0f}s)")
+    if args.mode == "notes":
+        # notes 是多文件导出（cards/时间线/索引），目录已在引擎内落盘
+        out_dir = st.get("out_dir", "")
+        print(f"OK notes -> {out_dir}")
+        print(f"   实体卡片 {st.get('entities', 0)} 张 · 时间线事件 "
+              f"{st.get('timeline', 0)} 条 · 文件 {len(st.get('files', []))} 个")
+        if args.out:                      # 可选：单独再存一份索引 md
+            open(args.out, "w", encoding="utf-8").write(md)
+            print(f"   索引副本 -> {args.out}")
+    else:
+        out = args.out or os.path.join(
+            ROOT, "reports",
+            f"{time.strftime('%Y%m%d_%H%M%S')}_{title[:20]}_{args.mode}.md")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        open(out, "w", encoding="utf-8").write(md)
+        print(f"OK {out}  ({time.time()-t0:.0f}s)")
 
 
 if __name__ == "__main__":

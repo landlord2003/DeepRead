@@ -115,6 +115,7 @@
   .mrow .act:hover{opacity:1}
   @media(max-width:900px){main{grid-template-columns:1fr}#left{display:none}}
 </style>
+<link rel="stylesheet" href="/vendor/theme.css">
 </head>
 <body>
 <header>
@@ -133,6 +134,8 @@
         <div class="mode" data-m="feynman"><div class="t">🎓 大白话讲解</div><div class="d">费曼式：术语翻译+类比+追问问题</div></div>
         <div class="mode" data-m="distill"><div class="t">🧪 萃猫蒸馏</div><div class="d">全书骨架 → 场景聚类 → 产出 N 个可导入的 SKILL.md 技能包（对标《城市生存自救指南》蒸馏成果），适合方法/经验类书籍</div></div>
         <div class="mode" data-m="book"><div class="t">📚 整书精读</div><div class="d">按章节分部深读 → 总编汇总（全书梗概+章节脉络+主题），适合 4 万字以上长书，耗时较长</div></div>
+        <div class="mode" data-m="notes"><div class="t">🗒️ 纪传+时间线</div><div class="d">纯叙事/历史书的读书笔记：导出 Obsidian 纪传卡片（双向链接）+ mermaid 时间线，落盘 reports/notes_*/</div></div>
+        <div class="mode" data-m="persona"><div class="t">🎭 人物精读</div><div class="d">蒸馏人而非书（nuwa 思想）：访谈/传记/自述 → 认知操作系统卡（RIA 思维框架/决策模式/表达DNA/金句逐字校验）+ 三重验证（跨域复现/问题生成力/认知排他）+ darwin 出题评测，落盘可导入的人物 SKILL.md</div></div>
       </div>
     </div>
     <div>
@@ -242,8 +245,8 @@ const optStory=()=>!document.getElementById("nostory").checked;
 
 /* ---------- 批量队列 ---------- */
 let BATCHTIMER=null, CURBATCH=null;
-const QST={distill:"萃猫蒸馏",cand:"候选素材萃取",skill:"技能包生成",wait:"等待中",parse:"解析中",ocr:"OCR 识别",map:"逐块深读",reduce:"分层汇总",
-  story:"生成故事梗概",critique:"对抗式复核",compose:"成稿",book:"分部深读",final:"成稿"};
+const QST={distill:"萃猫蒸馏",cand:"候选素材萃取",skill:"技能包生成",eval:"评测用例生成",persona:"人物认知蒸馏",darwineval:"darwin 装卡评测",personaeval:"人物卡评测",regen:"低分重生成",nuwacheck:"nuwa 三重验证",wait:"等待中",parse:"解析中",ocr:"OCR 识别",map:"逐块深读",reduce:"分层汇总",
+  story:"生成故事梗概",critique:"对抗式复核",compose:"成稿",book:"分部深读",final:"成稿",notes:"纪传卡片"};
 async function batchUpload(fs){
   const fd=new FormData();
   fs.forEach(f=>fd.append("file",f,f.name));
@@ -457,7 +460,7 @@ async function loadCompare(id){
   if(j.error)return;
   CURMD=j.md;
   const names={quick:"⚡ 快速要点",deep:"🔍 深度精读",map:"🗺️ 知识地图",
-    feynman:"🎓 大白话讲解",distill:"🧪 萃猫蒸馏",book:"📚 整书精读"};
+    feynman:"🎓 大白话讲解",distill:"🧪 萃猫蒸馏",book:"📚 整书精读",persona:"🎭 人物精读"};
   const keys=Object.keys(j.reports||{}).filter(m=>names[m]);
   const sum=(j.summary||"").trim();
   const box=sum?('<div class="storybox"><div class="sb-h">📖 故事梗概（各模式共用 · '

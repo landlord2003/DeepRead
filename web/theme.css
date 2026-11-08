@@ -1,0 +1,14 @@
+/* ThemeKit v1 | target=deepread | theme=classic | density=normal | 2026-10-24 15:11 */
+:root{
+  --bg:#0d1117;
+  --panel:#161b22;
+  --card:#1c2129;
+  --border:#2d333b;
+  --ink:#e6edf3;
+  --muted:#8b949e;
+  --accent:#4a9eff;
+  --ok:#3fb950;
+  --warn:#d29922;
+  --bad:#f85149;
+}
+body{zoom:1.0}

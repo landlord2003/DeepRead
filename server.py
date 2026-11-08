@@ -30,7 +30,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.join(ROOT, "web")
 REPORTS = os.path.join(ROOT, "reports")
 PORT = int(os.environ.get("DEEPREAD_PORT", "8790"))
-VERSION = "0.3"
+VERSION = "0.6"
 os.makedirs(REPORTS, exist_ok=True)
 
 JOBS = {}          # id -> {state, stage, done, total, md, ...}
@@ -304,6 +304,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, data, "text/html; charset=utf-8")
             except FileNotFoundError:
                 self._json({"error": "web/index.html 缺失"}, 500)
+        elif u.path.startswith("/vendor/"):
+            fname = u.path[len("/vendor/"):]
+            if ".." in fname or fname.startswith("/") or not fname.endswith((".js", ".css")):
+                self._json({"error": "not found"}, 404)
+            else:
+                fpath = os.path.join(WEB, "vendor", fname)
+                if os.path.isfile(fpath):
+                    data = open(fpath, "rb").read()
+                    ctype = ("application/javascript; charset=utf-8"
+                             if fname.endswith(".js") else "text/css; charset=utf-8")
+                    self._send(200, data, ctype)
+                else:
+                    self._json({"error": "not found"}, 404)
         elif u.path == "/api/status":
             job = JOBS.get((q.get("id") or [""])[0])
             if not job:
